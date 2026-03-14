@@ -1,6 +1,6 @@
 # Uma — High EQ Companion API
 
-An 8-node agentic pipeline inspired by [rumik.ai](https://rumik.ai)'s **Peek / Mesh / Silk** architecture, with **hybrid RAG** (JSON-backed). Built with FastAPI + LangGraph.
+
 
 ## Architecture
 
