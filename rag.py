@@ -2,16 +2,15 @@
 RAG engine — JSON-backed document store with hybrid retrieval.
 
 Retrieval pipeline:
-  1. Keyword scoring  (BM25-style TF-IDF)
+  1. Keyword scoring  (BM25 via rank_bm25)
   2. Semantic scoring  (OpenAI embeddings + cosine similarity)
-  3. Fused ranking     (weighted combination)
+  3. Fused ranking     (Reciprocal Rank Fusion)
   4. Relevance gate    (drop below threshold)
   5. Optional metadata filter
-  6. Smart chunking on ingest (overlap-aware splitting)
+  6. LangChain RecursiveCharacterTextSplitter on ingest
 """
 
 import json
-import math
 import os
 import re
 import uuid
@@ -21,7 +20,9 @@ from typing import Any, Optional
 
 import numpy as np
 from langchain_openai import OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel, Field
+from rank_bm25 import BM25Okapi
 
 
 # ---------------------------------------------------------------------------
@@ -51,33 +52,16 @@ def _tokenize(text: str) -> list[str]:
     return [w for w in re.findall(r"[a-z0-9\u0900-\u097F\u0980-\u09FF]+", text.lower()) if w not in _STOP_WORDS]
 
 
-def _smart_chunk(text: str, max_tokens: int = 300, overlap: int = 60) -> list[str]:
-    """Split text into overlapping chunks respecting sentence boundaries."""
-    sentences = re.split(r'(?<=[.!?।\n])\s+', text.strip())
-    chunks: list[str] = []
-    current: list[str] = []
-    current_len = 0
+_text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=500,
+    chunk_overlap=100,
+    separators=["\n\n", "\n", ".", "!", "?", "।", " ", ""],
+)
 
-    for sent in sentences:
-        sent_len = len(sent.split())
-        if current_len + sent_len > max_tokens and current:
-            chunks.append(" ".join(current))
-            # Keep last N tokens worth of sentences for overlap
-            overlap_buf: list[str] = []
-            overlap_len = 0
-            for s in reversed(current):
-                slen = len(s.split())
-                if overlap_len + slen > overlap:
-                    break
-                overlap_buf.insert(0, s)
-                overlap_len += slen
-            current = overlap_buf
-            current_len = overlap_len
-        current.append(sent)
-        current_len += sent_len
 
-    if current:
-        chunks.append(" ".join(current))
+def _smart_chunk(text: str, max_tokens: int = 500, overlap: int = 100) -> list[str]:
+    """Split text using LangChain RecursiveCharacterTextSplitter."""
+    chunks = _text_splitter.split_text(text)
     return chunks if chunks else [text]
 
 
@@ -92,40 +76,24 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (na * nb))
 
 
-def _bm25_score(query_tokens: list[str], doc_counts: dict[str, int], doc_len: int,
-                avg_dl: float, df: dict[str, int], n_docs: int,
-                k1: float = 1.5, b: float = 0.75) -> float:
-    score = 0.0
-    for qt in query_tokens:
-        if qt not in doc_counts:
-            continue
-        tf = doc_counts[qt]
-        d = df.get(qt, 0)
-        idf = math.log((n_docs - d + 0.5) / (d + 0.5) + 1.0)
-        tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * doc_len / max(avg_dl, 1)))
-        score += idf * tf_norm
-    return score
-
-
 # ---------------------------------------------------------------------------
 # RAG Store
 # ---------------------------------------------------------------------------
 
 DEFAULT_JSON_PATH = Path(__file__).parent / "data" / "documents.json"
 
-# Weights for hybrid fusion
-SEMANTIC_WEIGHT = 0.65
-KEYWORD_WEIGHT = 0.35
-DEFAULT_RELEVANCE_THRESHOLD = 0.25
+# RRF constant — higher value = more smoothing across rank differences
+RRF_K = 60
+DEFAULT_RELEVANCE_THRESHOLD = 0.15  # RRF max score ~0.033; 0.15 filters low-quality matches
 
 
 class RAGStore:
-    """Hybrid (semantic + keyword) retrieval over a JSON document store."""
+    """Hybrid (semantic + BM25 keyword) retrieval over a JSON document store."""
 
     def __init__(
         self,
         json_path: Optional[Path] = None,
-        embedding_model: str = "text-embedding-3-small",
+        embedding_model: str = "text-embedding-3-large",
         top_k: int = 5,
         relevance_threshold: float = DEFAULT_RELEVANCE_THRESHOLD,
     ):
@@ -137,9 +105,8 @@ class RAGStore:
         self._embeddings: Optional[OpenAIEmbeddings] = None
         self._chunks: list[DocumentChunk] = []
 
-        # Corpus-level BM25 stats (rebuilt on load / add)
-        self._df: dict[str, int] = {}
-        self._avg_dl: float = 0.0
+        # BM25 index — rebuilt whenever chunks change
+        self._bm25: Optional[BM25Okapi] = None
 
     # ----- embedding helper -----
 
@@ -151,16 +118,12 @@ class RAGStore:
     # ----- BM25 index -----
 
     def _rebuild_bm25_index(self) -> None:
-        df: dict[str, int] = {}
-        total_len = 0
+        tokenized = []
         for c in self._chunks:
             if c.token_counts is None:
                 c.token_counts = dict(Counter(_tokenize(c.text)))
-            total_len += sum(c.token_counts.values())
-            for token in c.token_counts:
-                df[token] = df.get(token, 0) + 1
-        self._df = df
-        self._avg_dl = total_len / max(len(self._chunks), 1)
+            tokenized.append(list(c.token_counts.keys()))
+        self._bm25 = BM25Okapi(tokenized) if tokenized else None
 
     # ----- persistence -----
 
@@ -173,6 +136,14 @@ class RAGStore:
             raw = json.load(f)
 
         self._chunks = [DocumentChunk(**item) for item in raw]
+
+        # Detect embedding dimension mismatch (e.g. switching small→large model) and re-embed
+        if self._chunks and self._chunks[0].embedding:
+            stored_dim = len(self._chunks[0].embedding)
+            expected_dim = 3072 if "large" in self.embedding_model else 1536
+            if stored_dim != expected_dim:
+                for c in self._chunks:
+                    c.embedding = None
 
         to_embed = [c for c in self._chunks if c.embedding is None]
         if to_embed and os.environ.get("OPENAI_API_KEY"):
@@ -197,8 +168,8 @@ class RAGStore:
         texts: list[str],
         metadata_per_doc: Optional[list[dict[str, Any]]] = None,
         auto_chunk: bool = True,
-        chunk_size: int = 300,
-        chunk_overlap: int = 60,
+        chunk_size: int = 500,
+        chunk_overlap: int = 100,
     ) -> list[str]:
         """
         Add texts.  If auto_chunk is True, long texts are split with overlap.
@@ -212,7 +183,7 @@ class RAGStore:
         all_meta: list[dict] = []
 
         for text, meta in zip(texts, meta_list):
-            if auto_chunk and len(text.split()) > chunk_size:
+            if auto_chunk and len(text) > chunk_size:
                 parts = _smart_chunk(text, max_tokens=chunk_size, overlap=chunk_overlap)
             else:
                 parts = [text]
@@ -248,7 +219,7 @@ class RAGStore:
         threshold: Optional[float] = None,
     ) -> list[dict[str, Any]]:
         """
-        Hybrid retrieval.
+        Hybrid retrieval using BM25 + semantic scores fused via Reciprocal Rank Fusion.
         Returns list of {"text": ..., "score": ..., "metadata": ...} dicts.
         """
         k = top_k or self.top_k
@@ -266,17 +237,20 @@ class RAGStore:
             return []
 
         query_tokens = _tokenize(query)
-        n_docs = len(candidates)
 
-        # --- keyword scores ---
-        keyword_scores: list[float] = []
-        for c in candidates:
-            if c.token_counts is None:
-                c.token_counts = dict(Counter(_tokenize(c.text)))
-            doc_len = sum(c.token_counts.values())
-            keyword_scores.append(
-                _bm25_score(query_tokens, c.token_counts, doc_len, self._avg_dl, self._df, n_docs)
-            )
+        # --- keyword scores (BM25) ---
+        if self._bm25 is not None and len(candidates) == len(self._chunks):
+            # Full corpus: use pre-built index
+            keyword_scores = self._bm25.get_scores(query_tokens).tolist()
+        else:
+            # Filtered subset: build a temporary BM25 index over candidates
+            tokenized_candidates = []
+            for c in candidates:
+                if c.token_counts is None:
+                    c.token_counts = dict(Counter(_tokenize(c.text)))
+                tokenized_candidates.append(list(c.token_counts.keys()))
+            tmp_bm25 = BM25Okapi(tokenized_candidates) if tokenized_candidates else None
+            keyword_scores = tmp_bm25.get_scores(query_tokens).tolist() if tmp_bm25 else [0.0] * len(candidates)
 
         # --- semantic scores ---
         has_embeddings = any(c.embedding is not None for c in candidates)
@@ -292,20 +266,20 @@ class RAGStore:
         else:
             semantic_scores = [0.0] * len(candidates)
 
-        # --- normalise into [0,1] ---
-        def _minmax(arr: list[float]) -> list[float]:
-            lo, hi = min(arr), max(arr)
-            rng = hi - lo
-            if rng == 0:
-                return [0.0] * len(arr)
-            return [(v - lo) / rng for v in arr]
+        # --- Reciprocal Rank Fusion ---
+        def _rrf_ranks(scores: list[float]) -> list[int]:
+            order = sorted(range(len(scores)), key=lambda i: -scores[i])
+            ranks = [0] * len(scores)
+            for rank, idx in enumerate(order, start=1):
+                ranks[idx] = rank
+            return ranks
 
-        norm_kw = _minmax(keyword_scores)
-        norm_sem = _minmax(semantic_scores)
+        sem_ranks = _rrf_ranks(semantic_scores)
+        kw_ranks = _rrf_ranks(keyword_scores)
 
         fused = [
-            SEMANTIC_WEIGHT * s + KEYWORD_WEIGHT * kw
-            for s, kw in zip(norm_sem, norm_kw)
+            1.0 / (RRF_K + sr) + 1.0 / (RRF_K + kr)
+            for sr, kr in zip(sem_ranks, kw_ranks)
         ]
 
         ranked = sorted(
