@@ -2,6 +2,10 @@ fastapi
 uvicorn[standard]
 langchain-core
 langchain-openai
+langchain-text-splitters
 langgraph
 pydantic
 numpy
+rank_bm25
+python-dotenv
+python-docx

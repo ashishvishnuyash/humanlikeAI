@@ -1,6 +1,6 @@
 # Uma — High EQ Companion API
 
-An 8-node agentic pipeline inspired by [rumik.ai](https://rumik.ai)'s **Peek / Mesh / Silk** architecture, with **hybrid RAG** (JSON-backed). Built with FastAPI + LangGraph.
+
 
 ## Architecture
 
@@ -82,6 +82,7 @@ Docs: **http://127.0.0.1:8000/docs**
 | `DELETE` | `/sessions/{id}` | Delete session |
 | `GET` | `/health` | Status + RAG chunk count |
 | `POST` | `/rag/documents` | Add documents (auto-chunked) |
+| `POST` | `/rag/ingest-docx` | Ingest all .docx from a folder (psychology docs) |
 | `GET` | `/rag/documents` | List all RAG chunks |
 | `DELETE` | `/rag/documents/{id}` | Delete a chunk |
 
@@ -131,3 +132,48 @@ Response includes the full pipeline trace:
 ```
 
 Long texts are automatically split into overlapping chunks for better retrieval.
+
+---
+
+## Psychologist chatbot (fine-tune via RAG)
+
+To turn Uma into a **psychologist-style chatbot** informed by your own docs (e.g. Intelligence Test, Personality Profiler, Emotional Intelligence Scale, Peer Relationship Test, Self Efficacy Scale, interpretations):
+
+1. **Add psychology .docx to the knowledge base** so the bot can retrieve test/scoring/interpretation content when relevant.
+
+   **Option A — CLI (recommended)**  
+   From the project root, run:
+
+   ```bash
+   python -m docx_ingest "C:\path\to\folder\with\docx"
+   ```
+
+   Example with your WhatsApp transfers folder:
+
+   ```powershell
+   python -m docx_ingest "C:\Users\USER\AppData\Local\Packages\5319275A.WhatsAppDesktop_cv1g1gvanyjgm\LocalState\sessions\EB26E9B6617363B798FCBEE0310E2C1B6E4AF29B\transfers\2026-11"
+   ```
+
+   **Option B — Copy docs into project, then ingest**
+
+   ```bash
+   mkdir -p data/psychology_docs
+   # Copy your .docx files into data/psychology_docs
+   python -m docx_ingest data/psychology_docs
+   ```
+
+   **Option C — API**  
+   After the server is running, call:
+
+   ```json
+   POST /rag/ingest-docx
+   { "folder_path": "C:\\full\\path\\to\\folder\\with\\docx" }
+   ```
+
+2. **Behaviour**  
+   - Ingested docs are chunked, embedded, and stored in `data/documents.json`.  
+   - During chat, the pipeline retrieves relevant chunks (e.g. test interpretations, scale descriptions) and passes them into the reply generator.  
+   - The prompt instructs Uma to use this knowledge in a **supportive, friend-like way**—no formal diagnosis or labelling, just insight and care.
+
+3. **“Fine-tune” in practice**  
+   Here “fine-tune” is implemented as **RAG**: the model is not retrained; the psychology documents are added to the knowledge base and used at reply time. To add more tests or interpretations, run `docx_ingest` again (or call `/rag/ingest-docx`) with the folder that contains the new .docx files.
