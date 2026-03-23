@@ -3,9 +3,9 @@ uvicorn[standard]
 langchain-core
 langchain-openai
 langchain-text-splitters
+langchain-pinecone
 langgraph
 pydantic
 numpy
-rank_bm25
 python-dotenv
 python-docx

@@ -1,18 +1,4 @@
-"""
-Uma — High EQ companion API.
 
-8-node agentic pipeline inspired by rumik.ai's Peek / Mesh / Silk architecture.
-
-Pipeline:
-  1. detect_signals    — language, emotion, intensity, tone shift detection
-  2. read_subtext      — multi-turn trajectory, "what do they really mean?"
-  3. extract_facts     — extract + categorise new facts (identity, preference, emotion, relationship)
-  4. recall_memories   — proactively surface relevant past memories
-  5. fetch_knowledge   — hybrid (semantic + keyword) knowledge retrieval
-  6. plan_response     — choose conversational move + expression style
-  7. generate_reply    — produce final reply in Uma's voice with tone/expression control
-  8. END
-"""
 
 import os
 import uuid
@@ -41,6 +27,7 @@ from prompts import (
     PLAN_RESPONSE,
     build_reply_prompt,
 )
+from report_api import report_router
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -400,6 +387,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(report_router)
 
 
 @app.post("/chat", response_model=ChatResponse)
