@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 def score_to_level(score: float) -> str:
     """Convert a 0-10 score to low / medium / high."""
-    if score < 3:
+    if score <= 3:
         return "low"
     elif score < 6:
         return "medium"
@@ -39,7 +39,7 @@ class MetricOutput(BaseModel):
     reason: str = Field(description="Brief justification for the score")
     weight: float = Field(
         ge=0, le=1, default=1.0,
-        description="Importance weight 0-1 (1 = most important)"
+        description="Evidence confidence weight 0-1: 1.0 = explicit evidence, 0.5 = indirect signals, 0.2 = very little evidence"
     )
 
 
@@ -56,7 +56,7 @@ class MentalHealthLLMOutput(BaseModel):
     work_life_balance: MetricOutput
     substance_use: MetricOutput
 
-    trend: str = Field(description="One of: improving, stable, declining")
+    trend: Literal["improving", "stable", "declining"] = Field(description="One of: improving, stable, declining")
     summary: str = Field(description="2-3 sentence narrative of mental health")
     confidence: float = Field(
         ge=0, le=1,
@@ -73,7 +73,7 @@ class PhysicalHealthLLMOutput(BaseModel):
     lifestyle: MetricOutput
     absenteeism: MetricOutput
 
-    trend: str = Field(description="One of: improving, stable, declining")
+    trend: Literal["improving", "stable", "declining"] = Field(description="One of: improving, stable, declining")
     summary: str = Field(description="2-3 sentence narrative of physical health")
     confidence: float = Field(
         ge=0, le=1,
@@ -85,8 +85,8 @@ class OverallLLMOutput(BaseModel):
     """Structured output the LLM must return for the final overall report."""
     score: float = Field(ge=0, le=10)
     confidence: float = Field(ge=0, le=1)
-    trend: str = Field(description="One of: improving, stable, declining")
-    priority: str = Field(description="One of: low, medium, high")
+    trend: Literal["improving", "stable", "declining"] = Field(description="One of: improving, stable, declining")
+    priority: Literal["low", "medium", "high"] = Field(description="One of: low, medium, high")
 
     summary: str = Field(description="Short overall-health summary")
     full_report: str = Field(
@@ -119,7 +119,7 @@ class MentalHealthBlock(BaseModel):
     confidence: float
     trend: str
     summary: str
-    metrics: dict  # keys are metric names → MetricDetail dicts
+    metrics: dict[str, MetricDetail]
 
 
 class PhysicalHealthBlock(BaseModel):
@@ -128,7 +128,7 @@ class PhysicalHealthBlock(BaseModel):
     confidence: float
     trend: str
     summary: str
-    metrics: dict
+    metrics: dict[str, MetricDetail]
 
 
 class OverallBlock(BaseModel):

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import List, Optional, TypedDict
 
 from langchain_openai import ChatOpenAI
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, END, START
 
 from report_prompts import (
     ANALYZE_MENTAL_HEALTH,
@@ -86,6 +86,11 @@ def analyze_physical_health(state: ReportState) -> dict:
 
  
 def generate_overall(state: ReportState) -> dict:
+    if state["mental_health"] is None:
+        raise ValueError("generate_overall: mental_health analysis missing from state.")
+    if state["physical_health"] is None:
+        raise ValueError("generate_overall: physical_health analysis missing from state.")
+
     llm = _get_llm()
     structured = llm.with_structured_output(OverallLLMOutput)
     result = (GENERATE_OVERALL | structured).invoke({
@@ -108,9 +113,14 @@ def build_report_graph():
     g.add_node("analyze_physical_health", analyze_physical_health)
     g.add_node("generate_overall", generate_overall)
 
-    g.set_entry_point("analyze_mental_health")
-    g.add_edge("analyze_mental_health", "analyze_physical_health")
+    # Fan-out: both analysis nodes run in parallel
+    g.add_edge(START, "analyze_mental_health")
+    g.add_edge(START, "analyze_physical_health")
+
+    # Join: generate_overall waits for both branches
+    g.add_edge("analyze_mental_health", "generate_overall")
     g.add_edge("analyze_physical_health", "generate_overall")
+
     g.add_edge("generate_overall", END)
 
     return g.compile()

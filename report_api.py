@@ -34,6 +34,9 @@ async def analyze_chat(req: ReportRequest):
     if not req.messages:
         raise HTTPException(400, "messages list cannot be empty.")
 
+    if len(req.messages) < 3:
+        raise HTTPException(400, "At least 3 messages are required for a meaningful report.")
+
     conversation_text = _format_conversation(req.messages)
     report = run_report(user_id=req.user_id, conversation_text=conversation_text)
     return report
