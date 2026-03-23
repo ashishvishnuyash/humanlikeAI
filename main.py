@@ -253,7 +253,7 @@ def generate_reply(state: AgentState):
         recalled=recalled,
         knowledge=knowledge,
     )
-    response = (prompt | creative).invoke({"messages": state["messages"]})
+    response = (prompt | creative).invoke({"messages": state["messages"][-20:]})
     return {"messages": [response]}
 
 
