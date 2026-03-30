@@ -1,4 +1,18 @@
+"""
+Uma — High EQ companion API.
 
+8-node agentic pipeline inspired by rumik.ai's Peek / Mesh / Silk architecture.
+
+Pipeline:
+  1. detect_signals    — language, emotion, intensity, tone shift detection
+  2. read_subtext      — multi-turn trajectory, "what do they really mean?"
+  3. extract_facts     — extract + categorise new facts (identity, preference, emotion, relationship)
+  4. recall_memories   — proactively surface relevant past memories
+  5. fetch_knowledge   — hybrid (semantic + keyword) knowledge retrieval
+  6. plan_response     — choose conversational move + expression style
+  7. generate_reply    — produce final reply in Uma's voice with tone/expression control
+  8. END
+"""
 
 import os
 import uuid
@@ -28,11 +42,22 @@ from prompts import (
     build_reply_prompt,
 )
 from report_api import report_router
-
+from routers.recommendations import router as recommendations_router
+from routers.auth import router as auth_router
+from routers.chat_wrapper import router as chat_wrapper_router
+from routers.community_gamification import router as com_gam_router
+from routers.reports_escalation import router as rep_esc_router
+from routers.voice_calls import router as voice_calls_router
+from routers.users import router as users_router
 
 # ═══════════════════════════════════════════════════════════════════════════
 # STATE
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+# ... (Skipped lines to find FastAPI app setup) ...
+
+
 
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], operator.add]
@@ -389,6 +414,13 @@ app.add_middleware(
 )
 
 app.include_router(report_router)
+app.include_router(recommendations_router, prefix="/api")
+app.include_router(auth_router, prefix="/api")
+app.include_router(chat_wrapper_router, prefix="/api")
+app.include_router(com_gam_router, prefix="/api")
+app.include_router(rep_esc_router, prefix="/api")
+app.include_router(voice_calls_router, prefix="/api")
+app.include_router(users_router, prefix="/api")
 
 
 @app.post("/chat", response_model=ChatResponse)

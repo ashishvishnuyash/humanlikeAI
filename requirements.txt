@@ -9,3 +9,6 @@ pydantic
 numpy
 python-dotenv
 python-docx
+firebase-admin
+python-multipart
+email-validator
