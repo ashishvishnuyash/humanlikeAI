@@ -798,7 +798,6 @@ GET /api/employees?department=Engineering&role=employee&include_inactive=false
       "direction":        "below",
       "benchmark_source": "Anonymised tech median (Diltak network)"
     },
-    {
       "metric":           "diltak_engagement_pct",
       "your_value":       61.0,
       "benchmark_value":  55.0,
@@ -2198,3 +2197,145 @@ export interface MutationResponse {
 | Force reset any password | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Platform stats | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Analytics dashboards | ✅ | ✅ | ✅ | ❌ | ❌ |
+
+---
+
+## 6. CHAT & REPORTS
+
+### `POST /api/chat_wrapper` — Interactive Chat & End-Session Reports
+> **Protected** — JWT required.
+
+#### Input (JSON or Multipart Form)
+```json
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello",
+      "sender": "user"
+    }
+  ],
+  "endSession": false,
+  "sessionType": "text",
+  "sessionDuration": 0,
+  "userId": "emp_uid",
+  "companyId": "company_uid",
+  "umaSessionId": "session_id_here"
+}
+```
+
+#### Output (Message Response)
+```json
+{
+  "type": "message",
+  "data": {
+    "content": "Hi there!",
+    "sender": "ai",
+    "umaSessionId": "session_id_here",
+    "emotion": "Happy",
+    "avatarEmotion": "HAPPY",
+    "emotionIntensity": 0.8,
+    "expressionStyle": "warm",
+    "conversationPhase": "opening"
+  }
+}
+```
+
+#### Output (Report Response — if `endSession: true`)
+```json
+{
+  "type": "report",
+  "data": {
+    "meta": {
+      "report_id": "...",
+      "user_id": "emp_uid",
+      "generated_at": "2025-04-05T04:00:00+00:00",
+      "version": "1.0"
+    },
+    "employee_id": "emp_uid",
+    "company_id": "company_uid",
+    "session_type": "text",
+    "session_duration_minutes": 0,
+    "mental_health": {
+      "score": 6.5,
+      "level": "medium",
+      "confidence": 0.9,
+      "trend": "stable",
+      "summary": "...",
+      "metrics": {
+         "stress_anxiety": { "score": 7.0, "level": "high", "reason": "...", "weight": 1.0 }
+      }
+    },
+    "physical_health": {
+       "score": 5.0,
+       "level": "medium",
+       "confidence": 0.8,
+       "trend": "stable",
+       "summary": "...",
+       "metrics": { ... }
+    },
+    "overall": {
+      "score": 5.8,
+      "level": "medium",
+      "confidence": 0.85,
+      "trend": "stable",
+      "priority": "medium",
+      "summary": "...",
+      "full_report": "...",
+      "key_insights": ["..."],
+      "strengths": ["..."],
+      "risks": ["..."],
+      "recommendations": ["..."]
+    }
+  }
+}
+```
+
+---
+
+### `POST /api/chat_wrapper/analyze` — Standalone Chat Analysis
+> **Protected** — JWT required. Generates full wellness report independently without ending a session.
+
+#### Input
+```json
+{
+  "user_id": "emp_uid",
+  "messages": [
+    {
+      "role": "user",
+      "content": "I'm so stressed"
+    },
+    {
+      "role": "assistant",
+      "content": "Tell me more"
+    }
+  ]
+}
+```
+
+#### Output `200 OK`
+```json
+{
+  "meta": {
+    "report_id": "...",
+    "user_id": "emp_uid",
+    "generated_at": "2025-04-05T04:00:00+00:00",
+    "version": "1.0"
+  },
+  "mental_health": { ... },
+  "physical_health": { ... },
+  "overall": {
+    "score": 5.8,
+    "level": "medium",
+    "confidence": 0.85,
+    "trend": "stable",
+    "priority": "medium",
+    "summary": "...",
+    "full_report": "...",
+    "key_insights": ["..."],
+    "strengths": ["..."],
+    "risks": ["..."],
+    "recommendations": ["..."]
+  }
+}
+```

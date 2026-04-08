@@ -3,14 +3,15 @@ import os
 import httpx
 from datetime import datetime
 from typing import List, Optional, Literal, Union, Dict, Any, Annotated
-from fastapi import APIRouter, Request, UploadFile, File, Form, HTTPException, Depends
+from fastapi import APIRouter, Request, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel, Field
 from openai import OpenAI
 from firebase_config import get_db
-from routers.auth import get_current_user
+from report_schemas import ReportRequest, ReportResponse
+from report_agent import run_report
 
 
-router = APIRouter(prefix="/chat_wrapper", tags=["Chat Wrapper"], dependencies=[Depends(get_current_user)])
+router = APIRouter(prefix="/chat_wrapper", tags=["Chat Wrapper"])
 
 class ChatMessageData(BaseModel):
     content: str
@@ -35,29 +36,9 @@ class ChatAssessmentResponse(BaseModel):
     type: Literal["assessment_questions"]
     data: AssessmentData
 
-class ReportData(BaseModel):
-    employee_id: Optional[str] = None
-    company_id: Optional[str] = None
-    session_type: Optional[str] = None
-    session_duration_minutes: Optional[int] = None
-    overall_wellness: Optional[int] = None
-    stress_level: Optional[int] = None
-    mood_rating: Optional[int] = None
-    energy_level: Optional[int] = None
-    work_satisfaction: Optional[int] = None
-    work_life_balance: Optional[int] = None
-    anxiety_level: Optional[int] = None
-    confidence_level: Optional[int] = None
-    sleep_quality: Optional[int] = None
-    risk_level: Optional[str] = None
-    notes: Optional[str] = None
-    recommendations: Optional[List[str]] = None
-    created_at: Optional[Any] = None
-    error: Optional[str] = None
-
 class ChatReportResponse(BaseModel):
     type: Literal["report"]
-    data: ReportData
+    data: Any
 
 ChatHandlerResponse = Annotated[
     Union[ChatMessageResponse, ChatAssessmentResponse, ChatReportResponse],
@@ -177,25 +158,16 @@ async def generate_wellness_report(messages: List[dict], session_type: str, sess
         
         report_res = run_report(user_id=user_id, conversation_text=conversation_text)
         
-        report_data = {
+        raw_report = report_res.model_dump(mode="json")
+        
+        report_data = {**raw_report}
+        report_data.update({
             'employee_id': user_id,
             'company_id': company_id,
             'session_type': session_type,
             'session_duration_minutes': session_duration,
-            'overall_wellness': int(report_res.overall.score),
-            'stress_level': int(report_res.mental_health.metrics.get('stress_anxiety', {}).get('score', 5)),
-            'mood_rating': int(report_res.mental_health.metrics.get('emotional_tone', {}).get('score', 5)),
-            'energy_level': int(report_res.physical_health.metrics.get('activity', {}).get('score', 5)),
-            'work_satisfaction': int(report_res.mental_health.metrics.get('motivation_engagement', {}).get('score', 5)),
-            'work_life_balance': int(report_res.mental_health.metrics.get('work_life_balance', {}).get('score', 5)),
-            'anxiety_level': int(report_res.mental_health.metrics.get('stress_anxiety', {}).get('score', 5)),
-            'confidence_level': int(report_res.mental_health.metrics.get('self_esteem', {}).get('score', 5)),
-            'sleep_quality': int(report_res.physical_health.metrics.get('lifestyle', {}).get('score', 5)),
-            'risk_level': report_res.overall.priority,
-            'notes': report_res.overall.summary,
-            'recommendations': report_res.overall.recommendations,
             'created_at': SERVER_TIMESTAMP
-        }
+        })
         
         if db and user_id and company_id:
             try:
@@ -203,7 +175,14 @@ async def generate_wellness_report(messages: List[dict], session_type: str, sess
             except Exception as e:
                 print(f"Firestore save error: {e}")
                 
-        return {"type": "report", "data": report_data}
+        client_data = {
+            **raw_report,
+            'employee_id': user_id,
+            'company_id': company_id,
+            'session_type': session_type,
+            'session_duration_minutes': session_duration
+        }
+        return {"type": "report", "data": client_data}
         
     except Exception as e:
         print(f"Error generating wellness report natively: {e}")
@@ -230,7 +209,10 @@ async def chat_handler(request: Request):
             file_parts.append(f"[Attached file: {f.filename}]")
         files_text = "\\n\\n".join(file_parts)
     else:
-        req_data = await request.json()
+        try:
+            req_data = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid or missing JSON body")
         
     messages = req_data.get("messages", [])
     if not messages:
@@ -259,11 +241,11 @@ async def chat_handler(request: Request):
             req_data.get("companyId", "")
         )
         
-        return await generate_chat_response(
-            messages, 
-            files_text, 
-            req_data.get("umaSessionId")
-        )
+    return await generate_chat_response(
+        messages, 
+        files_text, 
+        req_data.get("umaSessionId")
+    )
 
 class AiChatReq(BaseModel):
     message: str
@@ -301,3 +283,23 @@ async def handle_ai_chat(req: AiChatReq):
         }
     except Exception as e:
         raise HTTPException(500, detail=str(e))
+
+@router.post("/analyze", response_model=ReportResponse)
+async def analyze_chat_wrapper_standalone(req: ReportRequest):
+    """
+    Standalone endpoint to analyze a chat conversation and generate a comprehensive report.
+    This accepts a structured ReportRequest and returns a full ReportResponse.
+    """
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise HTTPException(500, "OPENAI_API_KEY not configured.")
+
+    if not req.messages:
+        raise HTTPException(400, "messages list cannot be empty.")
+
+    lines = []
+    for m in req.messages:
+        role = "User" if m.role.lower() == "user" else "Assistant"
+        lines.append(f"{role}: {m.content}")
+    conversation_text = "\n".join(lines)
+    
+    return run_report(user_id=req.user_id, conversation_text=conversation_text)
