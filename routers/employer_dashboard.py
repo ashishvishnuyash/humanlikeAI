@@ -21,7 +21,7 @@ from firebase_config import get_db
 from routers.auth import get_current_user
 
 # ─── Config ────────────────────────────────────────────────────────────────
-K_ANON_THRESHOLD = 5          # suppress any cohort smaller than this
+K_ANON_THRESHOLD = 1          # suppress any cohort smaller than this
 ROLLING_WEEKS    = 12         # default rolling window for trend endpoints
 
 router = APIRouter(
@@ -155,7 +155,6 @@ def _compute_team_size(company_id: str, db) -> int:
         docs = (
             db.collection("users")
             .where("company_id", "==", company_id)
-            .where("role", "not-in", ["employer", "hr"])
             .stream()
         )
         return sum(1 for _ in docs)
@@ -300,12 +299,12 @@ async def get_wellness_index(
     check_ins = _fetch_company_check_ins(company_id, db, days=period_days)
     team_size = _compute_team_size(company_id, db)
 
-    if team_size < K_ANON_THRESHOLD or len(check_ins) < K_ANON_THRESHOLD:
+    if team_size < K_ANON_THRESHOLD:
         raise HTTPException(
             status_code=422,
             detail={
                 "error": "insufficient_cohort",
-                "message": "Team size or data volume too small to compute anonymised metrics.",
+                "message": "Team size too small to compute anonymised metrics.",
                 "suppressed": True,
             },
         )
@@ -316,7 +315,7 @@ async def get_wellness_index(
 
     # Unique user count for participation (we count, never expose who)
     unique_users_checked_in = len({c.get("user_id") for c in check_ins if c.get("user_id")})
-    participation_pct = min(100.0, round((unique_users_checked_in / team_size) * 100, 1))
+    participation_pct = min(100.0, round((unique_users_checked_in / max(1, team_size)) * 100, 1))
 
     avg_mood   = sum(mood_scores)   / len(mood_scores)   if mood_scores   else 5.0
     avg_stress = sum(stress_scores) / len(stress_scores) if stress_scores else 5.0
@@ -347,7 +346,7 @@ async def get_wellness_index(
             prior_wi = (
                 ((sum(pm)/len(pm)/10)*100 * 0.35) +
                 (((10 - sum(ps)/len(ps))/10)*100 * 0.40) +
-                (min(100.0, round((len({c.get("user_id") for c in check_ins_prior})/team_size)*100,1)) * 0.25)
+                (min(100.0, round((len({c.get("user_id") for c in check_ins_prior})/max(1, team_size))*100,1)) * 0.25)
             )
             trend = round(wellness_index - prior_wi, 1)
 
@@ -496,11 +495,11 @@ async def get_engagement_signals(
     daily_users  = {s.get("user_id") for s in sessions if _ts_to_dt(s.get("created_at")) and _ts_to_dt(s.get("created_at")).date() == today}
     weekly_users = {s.get("user_id") for s in sessions if _ts_to_dt(s.get("created_at")) and _ts_to_dt(s.get("created_at")).date() >= week_start}
 
-    dau_pct = round(len(daily_users)  / team_size * 100, 1)
-    wau_pct = round(len(weekly_users) / team_size * 100, 1)
+    dau_pct = round(len(daily_users)  / max(1, team_size) * 100, 1)
+    wau_pct = round(len(weekly_users) / max(1, team_size) * 100, 1)
 
     unique_checkin = len({c.get("user_id") for c in check_ins})
-    checkin_pct    = round(min(100.0, unique_checkin / team_size * 100), 1)
+    checkin_pct    = round(min(100.0, unique_checkin / max(1, team_size) * 100), 1)
 
     # Session depth: avg of a depth_score field (0–10), or estimate from duration
     depth_scores = [s.get("depth_score", s.get("duration_minutes", 5) / 6) for s in sessions]
@@ -608,7 +607,7 @@ async def get_productivity_proxy(
     for wk, users in sorted(weekly_engagement.items()):
         if len(users) >= K_ANON_THRESHOLD:
             labels.append(wk)
-            values.append(round(len(users) / team_size * 100, 1))
+            values.append(round(len(users) / max(1, team_size) * 100, 1))
 
     quality = "high" if len(labels) >= 4 else ("medium" if len(labels) >= 2 else "low")
 
