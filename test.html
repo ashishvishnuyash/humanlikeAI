@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Uma API Tester</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0e0e12;
+    --surface: #16161d;
+    --surface2: #1e1e28;
+    --border: #2a2a3a;
+    --text: #e2e2ea;
+    --text-dim: #8888a0;
+    --accent: #a78bfa;
+    --accent-dim: #7c5cbf;
+    --green: #34d399;
+    --red: #f87171;
+    --orange: #fbbf24;
+    --blue: #60a5fa;
+    --radius: 10px;
+    --mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  }
+
+  body {
+    font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+
+  header {
+    padding: 28px 32px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em; }
+  header h1 span { color: var(--accent); }
+
+  .base-url-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: auto;
+  }
+  .base-url-bar label { font-size: .82rem; color: var(--text-dim); white-space: nowrap; }
+  .base-url-bar input {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-family: var(--mono);
+    font-size: .82rem;
+    width: 260px;
+  }
+
+  .container {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 24px 20px 60px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  /* ── Card ── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    transition: border-color .2s;
+  }
+  .card:focus-within { border-color: var(--accent-dim); }
+
+  .card-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 18px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .card-head:hover { background: var(--surface2); }
+
+  .method {
+    font-family: var(--mono);
+    font-size: .72rem;
+    font-weight: 700;
+    padding: 3px 8px;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+  }
+  .method.get    { background: #166534; color: #bbf7d0; }
+  .method.post   { background: #1e3a5f; color: #93c5fd; }
+  .method.delete { background: #7f1d1d; color: #fca5a5; }
+
+  .endpoint {
+    font-family: var(--mono);
+    font-size: .88rem;
+    color: var(--text);
+    flex: 1;
+  }
+  .card-desc {
+    font-size: .78rem;
+    color: var(--text-dim);
+    margin-left: auto;
+    text-align: right;
+  }
+  .chevron {
+    transition: transform .25s;
+    color: var(--text-dim);
+    font-size: .8rem;
+  }
+  .card.open .chevron { transform: rotate(90deg); }
+
+  .card-body {
+    display: none;
+    padding: 0 18px 18px;
+  }
+  .card.open .card-body { display: block; }
+
+  /* ── Form elements ── */
+  .field { margin-bottom: 12px; }
+  .field label {
+    display: block;
+    font-size: .78rem;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+  }
+  .field input, .field textarea, .field select {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-family: var(--mono);
+    font-size: .82rem;
+    resize: vertical;
+  }
+  .field textarea { min-height: 80px; }
+  .field input:focus, .field textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  .checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: .82rem;
+    color: var(--text-dim);
+  }
+  .checkbox-row input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    accent-color: var(--accent);
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 20px;
+    border: none;
+    border-radius: 6px;
+    font-size: .82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity .15s, transform .1s;
+  }
+  .btn:active { transform: scale(.97); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn-primary { background: var(--accent); color: #1a1a2e; }
+  .btn-danger  { background: var(--red); color: #1a1a2e; }
+
+  .btn-row { display: flex; gap: 8px; margin-top: 4px; }
+
+  /* ── Response area ── */
+  .response-area {
+    margin-top: 14px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .response-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 14px;
+    font-size: .75rem;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+  }
+  .status-pill {
+    font-family: var(--mono);
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: .72rem;
+  }
+  .status-pill.ok   { background: #166534; color: #bbf7d0; }
+  .status-pill.err  { background: #7f1d1d; color: #fca5a5; }
+  .status-pill.load { background: #78350f; color: #fde68a; }
+  .elapsed { margin-left: auto; font-family: var(--mono); }
+
+  .response-body {
+    padding: 14px;
+    font-family: var(--mono);
+    font-size: .78rem;
+    line-height: 1.7;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 420px;
+    overflow-y: auto;
+    color: var(--text);
+  }
+
+  /* ── Chat special ── */
+  .chat-log {
+    max-height: 300px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 12px;
+    padding: 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .chat-log:empty::after {
+    content: 'No messages yet. Send one below.';
+    color: var(--text-dim);
+    font-size: .8rem;
+    text-align: center;
+    padding: 20px;
+  }
+  .chat-bubble {
+    max-width: 80%;
+    padding: 8px 14px;
+    border-radius: 12px;
+    font-size: .85rem;
+    line-height: 1.5;
+  }
+  .chat-bubble.user {
+    align-self: flex-end;
+    background: var(--accent-dim);
+    color: #fff;
+    border-bottom-right-radius: 4px;
+  }
+  .chat-bubble.ai {
+    align-self: flex-start;
+    background: var(--surface2);
+    border-bottom-left-radius: 4px;
+  }
+  .chat-input-row {
+    display: flex;
+    gap: 8px;
+  }
+  .chat-input-row input {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: .88rem;
+  }
+  .chat-input-row input:focus { outline: none; border-color: var(--accent); }
+  .chat-meta {
+    margin-top: 10px;
+    font-size: .75rem;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    line-height: 1.8;
+  }
+  .chat-meta strong { color: var(--text); font-weight: 600; }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  /* JSON syntax highlight (lightweight) */
+  .json-key { color: #93c5fd; }
+  .json-str { color: #86efac; }
+  .json-num { color: #fde68a; }
+  .json-bool { color: #c4b5fd; }
+  .json-null { color: #f87171; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span>Uma</span> API Tester</h1>
+  <div class="base-url-bar">
+    <label for="baseUrl">Base URL</label>
+    <input type="text" id="baseUrl" value="http://127.0.0.1:8000">
+  </div>
+</header>
+
+<div class="container">
+
+  <!-- ═══ HEALTH ═══ -->
+  <div class="card open" id="card-health">
+    <div class="card-head" onclick="toggle('card-health')">
+      <span class="method get">GET</span>
+      <span class="endpoint">/health</span>
+      <span class="card-desc">Status &amp; RAG chunk count</span>
+      <span class="chevron">&#9654;</span>
+    </div>
+    <div class="card-body">
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="callHealth()">Send</button>
+      </div>
+      <div class="response-area" id="res-health" style="display:none"></div>
+    </div>
+  </div>
+
+  <!-- ═══ CHAT ═══ -->
+  <div class="card open" id="card-chat">
+    <div class="card-head" onclick="toggle('card-chat')">
+      <span class="method post">POST</span>
+      <span class="endpoint">/chat</span>
+      <span class="card-desc">Conversational endpoint (full pipeline)</span>
+      <span class="chevron">&#9654;</span>
+    </div>
+    <div class="card-body">
+      <div class="field">
+        <label>Session ID (blank = new session)</label>
+        <input type="text" id="chatSessionId" placeholder="leave empty for auto-generated">
+      </div>
+      <div class="chat-log" id="chatLog"></div>
+      <div class="chat-input-row">
+        <input type="text" id="chatMsg" placeholder="Type a message..." onkeydown="if(event.key==='Enter')callChat()">
+        <button class="btn btn-primary" id="chatSendBtn" onclick="callChat()">Send</button>
+      </div>
+      <div class="chat-meta" id="chatMeta"></div>
+      <div class="response-area" id="res-chat" style="display:none"></div>
+    </div>
+  </div>
+
+  <!-- ═══ GET SESSION ═══ -->
+  <div class="card" id="card-session-get">
+    <div class="card-head" onclick="toggle('card-session-get')">
+      <span class="method get">GET</span>
+      <span class="endpoint">/sessions/{id}</span>
+      <span class="card-desc">Session metadata &amp; memories</span>
+      <span class="chevron">&#9654;</span>
+    </div>
+    <div class="card-body">
+      <div class="field">
+        <label>Session ID</label>
+        <input type="text" id="getSessionId" placeholder="paste session id">
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="callGetSession()">Fetch</button>
+      </div>
+      <div class="response-area" id="res-session-get" style="display:none"></div>
+    </div>
+  </div>
+
+  <!-- ═══ DELETE SESSION ═══ -->
+  <div class="card" id="card-session-del">
+    <div class="card-head" onclick="toggle('card-session-del')">
+      <span class="method delete">DELETE</span>
+      <span class="endpoint">/sessions/{id}</span>
+      <span class="card-desc">Delete a session</span>
+      <span class="chevron">&#9654;</span>
+    </div>
+    <div class="card-body">
+      <div class="field">
+        <label>Session ID</label>
+        <input type="text" id="delSessionId" placeholder="paste session id">
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-danger" onclick="callDeleteSession()">Delete</button>
+      </div>
+      <div class="response-area" id="res-session-del" style="display:none"></div>
+    </div>
+  </div>
+
+  <!-- ═══ RAG ADD ═══ -->
+  <div class="card" id="card-rag-add">
+    <div class="card-head" onclick="toggle('card-rag-add')">
+      <span class="method post">POST</span>
+      <span class="endpoint">/rag/documents</span>
+      <span class="card-desc">Add documents to RAG store</span>
+      <span class="chevron">&#9654;</span>
+    </div>
+    <div class="card-body">
+      <div class="field">
+        <label>Texts (one per line — each line becomes a separate document)</label>
+        <textarea id="ragTexts" rows="4" placeholder="Line 1: first document text&#10;Line 2: second document text"></textarea>
+      </div>
+      <div class="field">
+        <label>Metadata JSON array (optional, one object per text)</label>
+        <input type="text" id="ragMeta" placeholder='[{"source":"wiki","topic":"cooking"}]'>
+      </div>
+      <div class="checkbox-row" style="margin-bottom:12px">
+        <input type="checkbox" id="ragAutoChunk" checked>
+        <label for="ragAutoChunk">Auto-chunk long texts</label>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="callRagAdd()">Add Documents</button>
+      </div>
+      <div class="response-area" id="res-rag-add" style="display:none"></div>
+    </div>
+  </div>
+
+  <!-- ═══ RAG LIST ═══ -->
+  <div class="card" id="card-rag-list">
+    <div class="card-head" onclick="toggle('card-rag-list')">
+      <span class="method get">GET</span>
+      <span class="endpoint">/rag/documents</span>
+      <span class="card-desc">List all RAG chunks</span>
+      <span class="chevron">&#9654;</span>
+    </div>
+    <div class="card-body">
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="callRagList()">Fetch</button>
+      </div>
+      <div class="response-area" id="res-rag-list" style="display:none"></div>
+    </div>
+  </div>
+
+  <!-- ═══ RAG DELETE ═══ -->
+  <div class="card" id="card-rag-del">
+    <div class="card-head" onclick="toggle('card-rag-del')">
+      <span class="method delete">DELETE</span>
+      <span class="endpoint">/rag/documents/{id}</span>
+      <span class="card-desc">Delete a RAG chunk</span>
+      <span class="chevron">&#9654;</span>
+    </div>
+    <div class="card-body">
+      <div class="field">
+        <label>Chunk ID</label>
+        <input type="text" id="ragDelId" placeholder="paste chunk id">
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-danger" onclick="callRagDelete()">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ REPORT ANALYZE ═══ -->
+  <div class="card" id="card-report-analyze">
+    <div class="card-head" onclick="toggle('card-report-analyze')">
+      <span class="method post">POST</span>
+      <span class="endpoint">/report/analyze</span>
+      <span class="card-desc">Generate health report from chat</span>
+      <span class="chevron">&#9654;</span>
+    </div>
+    <div class="card-body">
+      <div class="field">
+        <label>User ID</label>
+        <input type="text" id="reportUserId" value="test_user_01">
+      </div>
+      <div class="field">
+        <label>Messages (JSON array of {role, content})</label>
+        <textarea id="reportMessages" rows="8">[
+  {"role": "user", "content": "I've been feeling really overwhelmed with work lately. Haven't been sleeping well and skip meals."},
+  {"role": "assistant", "content": "I'm sorry to hear that. What's been keeping you up?"},
+  {"role": "user", "content": "Just thinking about upcoming deadlines. It's too much pressure. But I did go for a run today to clear my head, so that's something."}
+]</textarea>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="callReportAnalyze()">Generate Report</button>
+      </div>
+      <div class="response-area" id="res-report-analyze" style="display:none"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const $ = (sel) => document.querySelector(sel);
+const base = () => $('#baseUrl').value.replace(/\/+$/, '');
+
+function toggle(id) {
+  document.getElementById(id).classList.toggle('open');
+}
+
+/* ── Syntax-highlighted JSON ── */
+function highlightJson(obj) {
+  const raw = JSON.stringify(obj, null, 2);
+  return raw
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"([^"\\]|\\.)*"\s*:/g, (m) => `<span class="json-key">${m}</span>`)
+    .replace(/:\s*"([^"\\]|\\.)*"/g, (m) => `: <span class="json-str">${m.slice(2)}</span>`)
+    .replace(/:\s*(-?\d+\.?\d*)/g, (m, n) => `: <span class="json-num">${n}</span>`)
+    .replace(/:\s*(true|false)/g, (_, b) => `: <span class="json-bool">${b}</span>`)
+    .replace(/:\s*(null)/g, () => `: <span class="json-null">null</span>`);
+}
+
+function renderResponse(containerId, { status, elapsed, body, error }) {
+  const el = document.getElementById(containerId);
+  el.style.display = 'block';
+  const isOk = status >= 200 && status < 300;
+  const pillClass = error ? 'err' : isOk ? 'ok' : 'err';
+  const statusText = error ? 'ERR' : status;
+  const content = error ? error : highlightJson(body);
+  el.innerHTML = `
+    <div class="response-bar">
+      <span class="status-pill ${pillClass}">${statusText}</span>
+      <span class="elapsed">${elapsed}ms</span>
+    </div>
+    <div class="response-body">${content}</div>`;
+}
+
+function showLoading(containerId) {
+  const el = document.getElementById(containerId);
+  el.style.display = 'block';
+  el.innerHTML = `
+    <div class="response-bar">
+      <span class="status-pill load">...</span>
+      <span>Waiting for response</span>
+    </div>
+    <div class="response-body" style="color:var(--text-dim)">Loading...</div>`;
+}
+
+async function api(method, path, body, containerId) {
+  showLoading(containerId);
+  const t0 = performance.now();
+  try {
+    const opts = { method, headers: { 'Content-Type': 'application/json' } };
+    if (body !== undefined) opts.body = JSON.stringify(body);
+    const res = await fetch(base() + path, opts);
+    const elapsed = Math.round(performance.now() - t0);
+    const data = await res.json();
+    renderResponse(containerId, { status: res.status, elapsed, body: data });
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    const elapsed = Math.round(performance.now() - t0);
+    renderResponse(containerId, { status: 0, elapsed, error: e.message });
+    return { ok: false, data: null };
+  }
+}
+
+/* ── Health ── */
+function callHealth() {
+  api('GET', '/health', undefined, 'res-health');
+}
+
+/* ── Chat ── */
+let currentSessionId = null;
+
+async function callChat() {
+  const msg = $('#chatMsg').value.trim();
+  if (!msg) return;
+  $('#chatMsg').value = '';
+  $('#chatSendBtn').disabled = true;
+
+  appendBubble(msg, 'user');
+
+  const sid = $('#chatSessionId').value.trim() || currentSessionId || undefined;
+  const payload = { message: msg };
+  if (sid) payload.session_id = sid;
+
+  showLoading('res-chat');
+  const t0 = performance.now();
+
+  try {
+    const res = await fetch(base() + '/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const elapsed = Math.round(performance.now() - t0);
+    const data = await res.json();
+    renderResponse('res-chat', { status: res.status, elapsed, body: data });
+
+    if (res.ok) {
+      currentSessionId = data.session_id;
+      $('#chatSessionId').value = currentSessionId;
+      appendBubble(data.reply, 'ai');
+      renderChatMeta(data);
+    }
+  } catch (e) {
+    const elapsed = Math.round(performance.now() - t0);
+    renderResponse('res-chat', { status: 0, elapsed, error: e.message });
+  }
+  $('#chatSendBtn').disabled = false;
+}
+
+function appendBubble(text, role) {
+  const log = $('#chatLog');
+  const div = document.createElement('div');
+  div.className = `chat-bubble ${role}`;
+  div.textContent = text;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+function renderChatMeta(d) {
+  $('#chatMeta').innerHTML = `
+    <strong>Session:</strong> ${d.session_id}  |  
+    <strong>Emotion:</strong> ${d.peek.emotion} (${d.peek.emotion_intensity})  |  
+    <strong>Tone:</strong> ${d.peek.tone_shift}  |  
+    <strong>Language:</strong> ${d.peek.language}<br>
+    <strong>Subtext:</strong> ${d.peek.subtext}<br>
+    <strong>Deep need:</strong> ${d.peek.deep_need}  |  
+    <strong>Phase:</strong> ${d.peek.conversation_phase}  |  
+    <strong>Style:</strong> ${d.expression_style}<br>
+    <strong>Strategy:</strong> ${d.strategy}  |  
+    <strong>Memories:</strong> ${d.total_memories}  |  
+    <strong>RAG hits:</strong> ${d.retrieved_context.length}`;
+}
+
+/* ── Session GET ── */
+function callGetSession() {
+  const sid = $('#getSessionId').value.trim() || currentSessionId;
+  if (!sid) { alert('Enter a session ID'); return; }
+  api('GET', `/sessions/${encodeURIComponent(sid)}`, undefined, 'res-session-get');
+}
+
+/* ── Session DELETE ── */
+function callDeleteSession() {
+  const sid = $('#delSessionId').value.trim();
+  if (!sid) { alert('Enter a session ID'); return; }
+  api('DELETE', `/sessions/${encodeURIComponent(sid)}`, undefined, 'res-session-del');
+}
+
+/* ── RAG Add ── */
+function callRagAdd() {
+  const lines = $('#ragTexts').value.split('\n').map(l => l.trim()).filter(Boolean);
+  if (!lines.length) { alert('Enter at least one text line'); return; }
+  let meta = null;
+  const metaRaw = $('#ragMeta').value.trim();
+  if (metaRaw) {
+    try { meta = JSON.parse(metaRaw); } catch { alert('Invalid metadata JSON'); return; }
+  }
+  const payload = { texts: lines, auto_chunk: $('#ragAutoChunk').checked };
+  if (meta) payload.metadata = meta;
+  api('POST', '/rag/documents', payload, 'res-rag-add');
+}
+
+/* ── RAG List ── */
+function callRagList() {
+  api('GET', '/rag/documents', undefined, 'res-rag-list');
+}
+
+/* ── RAG Delete ── */
+function callRagDelete() {
+  const id = $('#ragDelId').value.trim();
+  if (!id) { alert('Enter a chunk ID'); return; }
+  api('DELETE', `/rag/documents/${encodeURIComponent(id)}`, undefined, 'res-rag-del');
+}
+
+/* ── Report Analyze ── */
+function callReportAnalyze() {
+  const userId = $('#reportUserId').value.trim();
+  if (!userId) { alert('Enter a User ID'); return; }
+  
+  let messages = [];
+  const msgRaw = $('#reportMessages').value.trim();
+  if (msgRaw) {
+    try { messages = JSON.parse(msgRaw); } catch { alert('Invalid messages JSON'); return; }
+  } else {
+    alert('Enter some messages'); return;
+  }
+  
+  const payload = { user_id: userId, messages: messages };
+  api('POST', '/report/analyze', payload, 'res-report-analyze');
+}
+
+/* ── Auto-fill session IDs from chat ── */
+new MutationObserver(() => {
+  if (currentSessionId) {
+    if (!$('#getSessionId').value) $('#getSessionId').value = currentSessionId;
+    if (!$('#delSessionId').value) $('#delSessionId').value = currentSessionId;
+  }
+}).observe($('#chatMeta'), { childList: true, subtree: true });
+</script>
+
+</body>
+</html>

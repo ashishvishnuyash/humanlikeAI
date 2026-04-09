@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyc.*
+.env
+venv/
+
+firebaseadmn.json

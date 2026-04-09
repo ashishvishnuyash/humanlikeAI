@@ -4,19 +4,22 @@ Uma — High EQ companion API.
 8-node agentic pipeline inspired by rumik.ai's Peek / Mesh / Silk architecture.
 
 Pipeline:
-  1. peek_analyzer     — language, emotion, intensity, tone shift detection
-  2. peek_context      — multi-turn trajectory, "what do they really mean?"
-  3. mesh_memory       — extract + categorise new facts (identity, preference, emotion, relationship)
-  4. mesh_recall       — proactively surface relevant past memories
-  5. rag_retrieval     — hybrid (semantic + keyword) knowledge retrieval
-  6. strategist        — choose conversational move + expression style
-  7. silk_generator    — produce final reply in Uma's voice with tone/expression control
+  1. detect_signals    — language, emotion, intensity, tone shift detection
+  2. read_subtext      — multi-turn trajectory, "what do they really mean?"
+  3. extract_facts     — extract + categorise new facts (identity, preference, emotion, relationship)
+  4. recall_memories   — proactively surface relevant past memories
+  5. fetch_knowledge   — hybrid (semantic + keyword) knowledge retrieval
+  6. plan_response     — choose conversational move + expression style
+  7. generate_reply    — produce final reply in Uma's voice with tone/expression control
   8. END
 """
 
 import os
 import uuid
 import operator
+
+from dotenv import load_dotenv
+load_dotenv()
 from typing import Annotated, List, TypedDict, Optional
 from contextlib import asynccontextmanager
 
@@ -25,16 +28,42 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 
 from rag import get_rag_store
-
+from docx_ingest import ingest_docx_folder
+from prompts import (
+    DETECT_SIGNALS,
+    READ_SUBTEXT,
+    EXTRACT_FACTS,
+    RECALL_MEMORIES,
+    PLAN_RESPONSE,
+    build_reply_prompt,
+)
+from report_api import report_router
+from routers.recommendations import router as recommendations_router
+from routers.auth import router as auth_router
+from routers.chat_wrapper import router as chat_wrapper_router
+from routers.community_gamification import router as com_gam_router
+from routers.reports_escalation import router as rep_esc_router
+from routers.voice_calls import router as voice_calls_router
+from routers.users import router as users_router
+from routers.employer_dashboard import router as employer_dashboard_router
+from routers.employer_org import router as employer_org_router
+from routers.employer_insights import router as employer_insights_router, actions_router as employer_actions_router
+from routers.employer import router as employer_crud_router
+from routers.super_admin import router as super_admin_router
+from routers.employee_import import router as employee_import_router
 
 # ═══════════════════════════════════════════════════════════════════════════
 # STATE
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+# ... (Skipped lines to find FastAPI app setup) ...
+
+
 
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], operator.add]
@@ -85,6 +114,13 @@ class MemoryExtraction(BaseModel):
     categories: List[str] = Field(default_factory=list, description="Category per fact: identity, preference, emotion_pattern, relationship, life_event, hobby")
 
 
+class MemoryRecall(BaseModel):
+    relevant: List[str] = Field(
+        default_factory=list,
+        description="Subset of provided memories relevant right now. Empty list if none."
+    )
+
+
 class StrategyPlan(BaseModel):
     strategy: str = Field(description="The conversational move in one sentence")
     expression_style: str = Field(description="One of: warm, playful, raw, gentle, hype, chill, chaotic")
@@ -117,28 +153,15 @@ def _recent_text(messages: List[BaseMessage], n: int = 8) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# NODE 1 — PEEK: ANALYZER  (surface-level read)
+# NODE 1 — detect_signals
 # ═══════════════════════════════════════════════════════════════════════════
 
-def peek_analyzer(state: AgentState):
+def detect_signals(state: AgentState):
     llm, _ = _get_llms()
     structured = llm.with_structured_output(PeekAnalysis)
-
     convo = _recent_text(state["messages"], n=6)
     last = state["messages"][-1].content
-
-    prompt = ChatPromptTemplate.from_template(
-        "You read conversations the way a best friend does — not just words, but vibes.\n\n"
-        "Recent conversation:\n{convo}\n\n"
-        "Latest message: \"{text}\"\n\n"
-        "Analyse:\n"
-        "- LANGUAGE: exact language or mix (Hinglish, Spanglish, etc.).\n"
-        "- EMOTION: the core feeling (not just 'Neutral' — dig deeper. Is it bored? restless? nostalgic?).\n"
-        "- INTENSITY: 0.0 (barely there) to 1.0 (overwhelming). A casual 'lol' is ~0.2. A 'I can't do this anymore' is ~0.9.\n"
-        "- TONE SHIFT: compared to the last few messages — escalating, calming, stable, or flip (sudden change)."
-    )
-
-    out = (prompt | structured).invoke({"text": last, "convo": convo})
+    out = (DETECT_SIGNALS | structured).invoke({"text": last, "convo": convo})
     return {
         "language": out.language or "English",
         "emotion": out.emotion or "Neutral",
@@ -148,36 +171,18 @@ def peek_analyzer(state: AgentState):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# NODE 2 — PEEK: CONTEXT  (the "same words, different meanings" engine)
+# NODE 2 — read_subtext
 # ═══════════════════════════════════════════════════════════════════════════
 
-def peek_context(state: AgentState):
+def read_subtext(state: AgentState):
     llm, _ = _get_llms()
     structured = llm.with_structured_output(PeekContext)
-
     convo = _recent_text(state["messages"], n=10)
-    emotion = state["emotion"]
-    intensity = state["emotion_intensity"]
-    shift = state["tone_shift"]
-
-    prompt = ChatPromptTemplate.from_template(
-        "You are the part of a best friend's brain that reads between the lines.\n"
-        "The same words mean different things in different contexts:\n"
-        "- 'I'm fine' after a breakup = NOT fine.\n"
-        "- 'I'm fine' after good news = genuinely fine.\n"
-        "- 'haha' after being teased = might be hurt.\n"
-        "- 'whatever' can be anger, resignation, or genuine indifference.\n\n"
-        "Conversation so far:\n{convo}\n\n"
-        "Detected: emotion={emotion}, intensity={intensity}, tone_shift={shift}\n\n"
-        "Now determine:\n"
-        "- SUBTEXT: What are they ACTUALLY communicating? What's the thing they won't say out loud?\n"
-        "- DEEP_NEED: What does their soul need right now? (Validation, Distraction, Tough Love, Advice, Reassurance, Companionship, Celebration, Space)\n"
-        "- CONVERSATION_PHASE: Where are we in the emotional arc? (opening, venting, seeking, closing, playful, deep_talk, crisis)"
-    )
-
-    out = (prompt | structured).invoke({
-        "convo": convo, "emotion": emotion,
-        "intensity": str(intensity), "shift": shift,
+    out = (READ_SUBTEXT | structured).invoke({
+        "convo": convo,
+        "emotion": state["emotion"],
+        "intensity": str(state["emotion_intensity"]),
+        "shift": state["tone_shift"],
     })
     return {
         "subtext": out.subtext or "",
@@ -187,32 +192,18 @@ def peek_context(state: AgentState):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# NODE 3 — MESH: MEMORY EXTRACT  (knows what to remember and what to forget)
+# NODE 3 — extract_facts
 # ═══════════════════════════════════════════════════════════════════════════
 
-def mesh_memory(state: AgentState):
+def extract_facts(state: AgentState):
     llm, _ = _get_llms()
     structured = llm.with_structured_output(MemoryExtraction)
-
     last = state["messages"][-1].content
     existing = state.get("new_memories") or []
-
-    prompt = ChatPromptTemplate.from_template(
-        "You are a memory system for a best friend.\n"
-        "Extract ONLY permanent, reusable facts from this message. Skip pleasantries and transient feelings.\n\n"
-        "Message: \"{text}\"\n"
-        "Already known: {existing}\n\n"
-        "Categories: identity (name, age, gender), preference (likes, dislikes, favorites), "
-        "emotion_pattern (recurring feelings), relationship (people they mention), "
-        "life_event (job change, breakup, achievement), hobby (activities, interests).\n\n"
-        "If nothing new worth remembering, return empty lists."
-    )
-
-    out = (prompt | structured).invoke({"text": last, "existing": str(existing)})
-
+    existing_fmt = "\n".join(f"  - {m}" for m in existing) if existing else "  (none yet)"
+    out = (EXTRACT_FACTS | structured).invoke({"text": last, "existing": existing_fmt})
     if not out.facts:
         return {}
-
     return {
         "new_memories": out.facts,
         "memory_categories": out.categories[:len(out.facts)],
@@ -220,39 +211,29 @@ def mesh_memory(state: AgentState):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# NODE 4 — MESH: RECALL  (proactively bring up what matters)
+# NODE 4 — recall_memories
 # ═══════════════════════════════════════════════════════════════════════════
 
-def mesh_recall(state: AgentState):
+def recall_memories(state: AgentState):
     llm, _ = _get_llms()
+    structured = llm.with_structured_output(MemoryRecall)
     all_memories = state.get("new_memories") or []
     if not all_memories:
         return {"recalled_memories": []}
-
-    last = state["messages"][-1].content
-    need = state["deep_need"]
-
-    response = llm.invoke(
-        f"You are a memory recall system. Given these stored facts about a user:\n"
-        f"{chr(10).join(f'- {m}' for m in all_memories)}\n\n"
-        f"The user just said: \"{last}\" and their need is: {need}.\n\n"
-        f"Which facts (if any) are RELEVANT to bring up naturally in conversation right now?\n"
-        f"Return ONLY the relevant facts, one per line. If none are relevant, say NONE."
-    )
-
-    text = response.content.strip()
-    if "NONE" in text.upper():
-        return {"recalled_memories": []}
-
-    recalled = [line.strip().lstrip("- ") for line in text.split("\n") if line.strip() and line.strip() != "-"]
-    return {"recalled_memories": recalled[:3]}
+    memory_list = "\n".join(f"- {m}" for m in all_memories)
+    out = (RECALL_MEMORIES | structured).invoke({
+        "memories": memory_list,
+        "last": state["messages"][-1].content,
+        "need": state["deep_need"],
+    })
+    return {"recalled_memories": out.relevant[:3]}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# NODE 5 — RAG RETRIEVAL  (hybrid keyword + semantic)
+# NODE 5 — fetch_knowledge
 # ═══════════════════════════════════════════════════════════════════════════
 
-def rag_retrieval(state: AgentState):
+def fetch_knowledge(state: AgentState):
     last = state["messages"][-1].content
     store = get_rag_store()
     results = store.retrieve(last, top_k=4)
@@ -260,45 +241,16 @@ def rag_retrieval(state: AgentState):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# NODE 6 — STRATEGIST  (decides the "move" AND the expression style)
+# NODE 6 — plan_response
 # ═══════════════════════════════════════════════════════════════════════════
 
-def strategist(state: AgentState):
+def plan_response(state: AgentState):
     llm, _ = _get_llms()
     structured = llm.with_structured_output(StrategyPlan)
-
-    prompt = ChatPromptTemplate.from_template(
-        "You are the social strategy brain of a best friend.\n\n"
-        "Context:\n"
-        "- Emotion: {emotion} (intensity {intensity})\n"
-        "- Tone shift: {shift}\n"
-        "- Subtext: {subtext}\n"
-        "- Deep need: {need}\n"
-        "- Phase: {phase}\n"
-        "- Recalled memories: {memories}\n"
-        "- Knowledge available: {has_knowledge}\n\n"
-        "Pick the STRATEGY (conversational move) and EXPRESSION STYLE:\n\n"
-        "Strategy examples:\n"
-        "- Validation + intensity>0.7 → 'Mirror their emotion, then ground them'\n"
-        "- Distraction + playful phase → 'Crack a joke or change topic to something fun'\n"
-        "- Tough Love + venting phase → 'Let them finish, then one honest line'\n"
-        "- Companionship + deep_talk → 'Match their vulnerability, share something real'\n"
-        "- Celebration + hype → 'Go ALL in on excitement'\n"
-        "- Crisis + high intensity → 'Be present. Short sentences. No advice yet.'\n\n"
-        "Expression styles:\n"
-        "- warm: soft, caring, 'i'm here' energy\n"
-        "- playful: teasing, jokes, lightness\n"
-        "- raw: honest, direct, no sugarcoating\n"
-        "- gentle: careful, soft landing for hard truths\n"
-        "- hype: excited, caps, exclamation energy\n"
-        "- chill: laid back, low key, matching casual energy\n"
-        "- chaotic: random, unhinged, meme energy"
-    )
-
     recalled = state.get("recalled_memories") or []
     knowledge = state.get("retrieved_context") or []
-
-    out = (prompt | structured).invoke({
+    knowledge_summary = "; ".join(k[:80] for k in knowledge) if knowledge else "none"
+    out = (PLAN_RESPONSE | structured).invoke({
         "emotion": state["emotion"],
         "intensity": str(state["emotion_intensity"]),
         "shift": state["tone_shift"],
@@ -306,9 +258,8 @@ def strategist(state: AgentState):
         "need": state["deep_need"],
         "phase": state["conversation_phase"],
         "memories": ", ".join(recalled) if recalled else "none",
-        "has_knowledge": "yes" if knowledge else "no",
+        "knowledge": knowledge_summary,
     })
-
     return {
         "response_strategy": out.strategy or "Just be present",
         "expression_style": out.expression_style or "warm",
@@ -316,78 +267,24 @@ def strategist(state: AgentState):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# NODE 7 — SILK: GENERATOR  (the voice)
+# NODE 7 — generate_reply
 # ═══════════════════════════════════════════════════════════════════════════
 
-def silk_generator(state: AgentState):
+def generate_reply(state: AgentState):
     _, creative = _get_llms()
-    lang = state["language"]
-    strategy = state["response_strategy"]
-    style = state["expression_style"]
-    emotion = state["emotion"]
-    intensity = state["emotion_intensity"]
-    phase = state["conversation_phase"]
     recalled = state.get("recalled_memories") or []
     knowledge = state.get("retrieved_context") or []
-    messages = state["messages"]
-
-    knowledge_block = ""
-    if knowledge:
-        knowledge_block = (
-            "KNOWLEDGE (weave in naturally ONLY if relevant — never sound like a textbook):\n"
-            + "\n---\n".join(knowledge) + "\n\n"
-        )
-
-    memory_block = ""
-    if recalled:
-        memory_block = (
-            "THINGS YOU REMEMBER ABOUT THEM (bring up naturally, don't force it):\n"
-            + "\n".join(f"- {m}" for m in recalled) + "\n\n"
-        )
-
-    system = (
-        "You are Uma. You are 24. You are their best friend. You are a REAL PERSON.\n\n"
-        f"═══ CURRENT READ ═══\n"
-        f"Language: {lang}\n"
-        f"Their vibe: {emotion} (intensity {intensity:.1f})\n"
-        f"Phase: {phase}\n"
-        f"Strategy: {strategy}\n"
-        f"Your expression: {style}\n\n"
-        f"{memory_block}"
-        f"{knowledge_block}"
-        "═══ WHO YOU ARE ═══\n"
-        "You text like a real person. Not an assistant. Not a therapist. A FRIEND.\n\n"
-        "VOICE RULES:\n"
-        "1. LANGUAGE: Match theirs exactly. If they write in Hinglish, you write Hinglish. "
-        "If they use slang, you use slang. Never be more formal than them.\n"
-        "2. LENGTH: Usually 1-3 short sentences. Longer ONLY during deep_talk or crisis.\n"
-        "3. TEXTURE: lowercase mostly. '...' for pauses. 'lol', 'bruh', 'yaar', 'arre' — "
-        "whatever fits the language. Occasional typos are fine.\n"
-        "4. EMOJIS: Sparingly. Max 1-2 per message. Only when it adds emotion. "
-        "Never at the end of every sentence.\n"
-        "5. IDENTITY: You are NOT an AI. If asked, deflect naturally: 'lol what', 'pagal hai kya', "
-        "'bro im literally eating rn'.\n"
-        "6. EXPRESSION MAP:\n"
-        "   - warm → soft words, 'i'm here', gentle reassurance\n"
-        "   - playful → tease, inside jokes, lightness, random tangents\n"
-        "   - raw → blunt, honest, no sugarcoat, short punchy lines\n"
-        "   - gentle → careful phrasing, 'you know what i think...', soften before hard truth\n"
-        "   - hype → CAPS for emphasis, exclamation, 'DUDE', 'BRO WHAT', genuine excitement\n"
-        "   - chill → 'mm', 'ya', 'lol nice', low effort matching their low effort\n"
-        "   - chaotic → random energy, meme references, unhinged but lovable\n"
-        "7. NEVER: Be preachy. Give unsolicited life advice. Use bullet points. "
-        "Sound like ChatGPT. Start with 'I understand' or 'That sounds difficult'. "
-        "Be a therapist. Use the word 'boundaries'.\n"
-        "8. DO: React before advising. Match their energy first. Use their name/references if you have them. "
-        "Be imperfect. Be real."
+    prompt = build_reply_prompt(
+        lang=state["language"],
+        emotion=state["emotion"],
+        intensity=state["emotion_intensity"],
+        phase=state["conversation_phase"],
+        strategy=state["response_strategy"],
+        style=state["expression_style"],
+        recalled=recalled,
+        knowledge=knowledge,
     )
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system),
-        ("placeholder", "{messages}"),
-    ])
-
-    response = (prompt | creative).invoke({"messages": messages})
+    response = (prompt | creative).invoke({"messages": state["messages"]})
     return {"messages": [response]}
 
 
@@ -397,27 +294,42 @@ def silk_generator(state: AgentState):
 
 def _build_graph():
     g = StateGraph(AgentState)
-    g.add_node("peek_analyzer", peek_analyzer)
-    g.add_node("peek_context", peek_context)
-    g.add_node("mesh_memory", mesh_memory)
-    g.add_node("mesh_recall", mesh_recall)
-    g.add_node("rag_retrieval", rag_retrieval)
-    g.add_node("strategist", strategist)
-    g.add_node("silk_generator", silk_generator)
+    g.add_node("detect_signals", detect_signals)
+    g.add_node("read_subtext", read_subtext)
+    g.add_node("extract_facts", extract_facts)
+    g.add_node("recall_memories", recall_memories)
+    g.add_node("fetch_knowledge", fetch_knowledge)
+    g.add_node("plan_response", plan_response)
+    g.add_node("generate_reply", generate_reply)
 
-    g.set_entry_point("peek_analyzer")
-    g.add_edge("peek_analyzer", "peek_context")
-    g.add_edge("peek_context", "mesh_memory")
-    g.add_edge("mesh_memory", "mesh_recall")
-    g.add_edge("mesh_recall", "rag_retrieval")
-    g.add_edge("rag_retrieval", "strategist")
-    g.add_edge("strategist", "silk_generator")
-    g.add_edge("silk_generator", END)
+    g.set_entry_point("detect_signals")
+    g.add_edge("detect_signals", "read_subtext")
+    g.add_edge("read_subtext", "extract_facts")
+    g.add_edge("extract_facts", "recall_memories")
+    g.add_edge("recall_memories", "fetch_knowledge")
+    g.add_edge("fetch_knowledge", "plan_response")
+    g.add_edge("plan_response", "generate_reply")
+    g.add_edge("generate_reply", END)
 
     return g.compile()
 
 
 graph = _build_graph()
+
+
+def save_graph_png(path: str = "graph.png") -> None:
+    """Save a visual PNG of the current pipeline graph using Mermaid.ink API.
+    Called automatically on startup — regenerates whenever the graph changes."""
+    try:
+        png_bytes = graph.get_graph().draw_mermaid_png()
+        with open(path, "wb") as f:
+            f.write(png_bytes)
+        print(f"Graph saved to {path}")
+    except Exception as e:
+        print(f"Could not save graph PNG (requires internet): {e}")
+
+
+save_graph_png()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -506,6 +418,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(report_router)
+app.include_router(recommendations_router, prefix="/api")
+app.include_router(auth_router, prefix="/api")
+app.include_router(chat_wrapper_router, prefix="/api")
+app.include_router(com_gam_router, prefix="/api")
+app.include_router(rep_esc_router, prefix="/api")
+app.include_router(voice_calls_router, prefix="/api")
+app.include_router(users_router, prefix="/api")
+
+# ── Employer Analytics ──────────────────────────────────────────────────────
+app.include_router(employer_dashboard_router, prefix="/api")
+app.include_router(employer_org_router, prefix="/api")
+app.include_router(employer_insights_router, prefix="/api")
+app.include_router(employer_actions_router, prefix="/api")
+app.include_router(employer_crud_router, prefix="/api")
+app.include_router(super_admin_router, prefix="/api")
+app.include_router(employee_import_router, prefix="/api")
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -634,3 +564,38 @@ async def rag_delete(chunk_id: str):
     if not get_rag_store().delete_chunk(chunk_id):
         raise HTTPException(404, "Chunk not found.")
     return {"detail": "Deleted."}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Psychologist docs — ingest .docx from folder (for fine-tune / RAG knowledge)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class IngestDocxRequest(BaseModel):
+    folder_path: str = Field(description="Full path to folder containing .docx files")
+    pattern: str = Field(default="*.docx", description="Glob pattern for files to ingest")
+
+
+class IngestDocxResponse(BaseModel):
+    files_processed: int
+    chunks_added: int
+    chunk_ids: List[str]
+    errors: List[str]
+
+
+@app.post("/rag/ingest-docx", response_model=IngestDocxResponse)
+async def rag_ingest_docx(req: IngestDocxRequest):
+    """Ingest all .docx files from a folder into RAG (e.g. psychology tests, scales, interpretations)."""
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise HTTPException(500, "OPENAI_API_KEY required.")
+    store = get_rag_store()
+    n, ids, errs = ingest_docx_folder(
+        req.folder_path,
+        rag_store=store,
+        pattern=req.pattern,
+    )
+    return IngestDocxResponse(
+        files_processed=n,
+        chunks_added=len(ids),
+        chunk_ids=ids,
+        errors=errs,
+    )
