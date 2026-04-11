@@ -12,3 +12,8 @@ python-docx
 firebase-admin
 python-multipart
 email-validator
+pandas
+openpyxl
+chardet
+httpx
+resend

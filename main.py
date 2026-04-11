@@ -54,6 +54,7 @@ from routers.employer_org import router as employer_org_router
 from routers.employer_insights import router as employer_insights_router, actions_router as employer_actions_router
 from routers.employer import router as employer_crud_router
 from routers.super_admin import router as super_admin_router
+from routers.employee_import import router as employee_import_router
 
 # ═══════════════════════════════════════════════════════════════════════════
 # STATE
@@ -434,6 +435,7 @@ app.include_router(employer_insights_router, prefix="/api")
 app.include_router(employer_actions_router, prefix="/api")
 app.include_router(employer_crud_router, prefix="/api")
 app.include_router(super_admin_router, prefix="/api")
+app.include_router(employee_import_router, prefix="/api")
 
 
 @app.post("/chat", response_model=ChatResponse)
