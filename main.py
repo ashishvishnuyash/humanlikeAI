@@ -41,29 +41,11 @@ from prompts import (
     PLAN_RESPONSE,
     build_reply_prompt,
 )
-from report_api import report_router
-from routers.recommendations import router as recommendations_router
-from routers.auth import router as auth_router
-from routers.chat_wrapper import router as chat_wrapper_router
-from routers.community_gamification import router as com_gam_router
-from routers.reports_escalation import router as rep_esc_router
-from routers.voice_calls import router as voice_calls_router
-from routers.users import router as users_router
-from routers.employer_dashboard import router as employer_dashboard_router
-from routers.employer_org import router as employer_org_router
-from routers.employer_insights import router as employer_insights_router, actions_router as employer_actions_router
-from routers.employer import router as employer_crud_router
-from routers.super_admin import router as super_admin_router
-from routers.employee_import import router as employee_import_router
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # STATE
 # ═══════════════════════════════════════════════════════════════════════════
-
-
-# ... (Skipped lines to find FastAPI app setup) ...
-
-
 
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], operator.add]
@@ -418,24 +400,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-app.include_router(report_router)
-app.include_router(recommendations_router, prefix="/api")
-app.include_router(auth_router, prefix="/api")
-app.include_router(chat_wrapper_router, prefix="/api")
-app.include_router(com_gam_router, prefix="/api")
-app.include_router(rep_esc_router, prefix="/api")
-app.include_router(voice_calls_router, prefix="/api")
-app.include_router(users_router, prefix="/api")
-
-# ── Employer Analytics ──────────────────────────────────────────────────────
-app.include_router(employer_dashboard_router, prefix="/api")
-app.include_router(employer_org_router, prefix="/api")
-app.include_router(employer_insights_router, prefix="/api")
-app.include_router(employer_actions_router, prefix="/api")
-app.include_router(employer_crud_router, prefix="/api")
-app.include_router(super_admin_router, prefix="/api")
-app.include_router(employee_import_router, prefix="/api")
 
 
 @app.post("/chat", response_model=ChatResponse)
