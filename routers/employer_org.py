@@ -39,9 +39,16 @@ router = APIRouter(
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def _fetch_all_users(company_id: str, db) -> List[dict]:
+    from routers.employer_dashboard import _cache_get, _cache_set
+    cache_key = f"all_users:{company_id}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
         docs = db.collection("users").where("company_id", "==", company_id).stream()
-        return [d.to_dict() for d in docs]
+        results = [d.to_dict() for d in docs]
+        _cache_set(cache_key, results)
+        return results
     except Exception as e:
         print(f"[employer_org] users fetch error: {e}")
         return []
