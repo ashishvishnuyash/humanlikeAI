@@ -11,14 +11,38 @@ Privacy rules enforced across every endpoint:
 
 import math
 import random
+import threading
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from firebase_config import get_db
 from routers.auth import get_current_user
+
+# ─── Simple TTL Cache ─────────────────────────────────────────────────────
+# Prevents Firestore quota exhaustion when multiple dashboard endpoints
+# are called in parallel (each would otherwise independently read the
+# same user profile / company data).
+
+_cache: Dict[str, Tuple[float, Any]] = {}
+_cache_lock = threading.Lock()
+CACHE_TTL = 120  # seconds
+
+
+def _cache_get(key: str):
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry and time.time() - entry[0] < CACHE_TTL:
+            return entry[1]
+    return None
+
+
+def _cache_set(key: str, value: Any):
+    with _cache_lock:
+        _cache[key] = (time.time(), value)
 
 # ─── Config ────────────────────────────────────────────────────────────────
 K_ANON_THRESHOLD = 1          # suppress any cohort smaller than this
@@ -64,10 +88,20 @@ def _suppress(value: Any, count: int, threshold: int = K_ANON_THRESHOLD):
 
 def _get_employer_role(uid: str, db) -> Optional[dict]:
     """Fetch the caller's profile; ensure role == employer or manager."""
-    doc = db.collection("users").document(uid).get()
-    if not doc.exists:
+    cache_key = f"employer_role:{uid}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        doc = db.collection("users").document(uid).get()
+        if not doc.exists:
+            return None
+        profile = doc.to_dict()
+        _cache_set(cache_key, profile)
+        return profile
+    except Exception as e:
+        print(f"[employer_dashboard] employer role fetch error: {e}")
         return None
-    return doc.to_dict()
 
 
 def _require_employer(user_token: dict):
@@ -85,12 +119,45 @@ def _require_employer(user_token: dict):
 
 # ─── Firestore Aggregation Helpers ──────────────────────────────────────────
 
+def _fetch_company_user_ids(company_id: str, db) -> List[str]:
+    """Return all user IDs belonging to a company."""
+    cache_key = f"user_ids:{company_id}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        docs = db.collection("users").where("company_id", "==", company_id).stream()
+        ids = []
+        for doc in docs:
+            d = doc.to_dict()
+            uid = d.get("id") or doc.id
+            if uid:
+                ids.append(uid)
+        _cache_set(cache_key, ids)
+        return ids
+    except Exception as e:
+        print(f"[employer_dashboard] user_ids fetch error: {e}")
+        return []
+
+
 def _fetch_company_check_ins(company_id: str, db, days: int = 90) -> List[dict]:
-    """Fetch check-in records for a company in the last `days` days."""
+    """Fetch mental health reports for a company in the last `days` days.
+
+    Reads from `mental_health_reports` collection (the actual data source)
+    and normalises fields to the check-in format the dashboard expects:
+      mood_score, stress_level, user_id, company_id, created_at.
+    Uses a TTL cache keyed on (company_id, days) to avoid duplicate
+    Firestore reads when multiple endpoints run in parallel.
+    """
+    cache_key = f"check_ins:{company_id}:{days}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     cutoff = utc_now() - timedelta(days=days)
     try:
         docs = (
-            db.collection("check_ins")
+            db.collection("mental_health_reports")
             .where("company_id", "==", company_id)
             .limit(5000)
             .stream()
@@ -100,40 +167,36 @@ def _fetch_company_check_ins(company_id: str, db, days: int = 90) -> List[dict]:
             data = d.to_dict()
             ts = _ts_to_dt(data.get("created_at"))
             if ts and ts >= cutoff:
-                results.append(data)
+                results.append({
+                    "user_id": data.get("employee_id"),
+                    "company_id": company_id,
+                    "mood_score": data.get("mood_rating", 5),
+                    "stress_level": data.get("stress_level", 5),
+                    "created_at": data.get("created_at"),
+                })
+        _cache_set(cache_key, results)
         return results
     except Exception as e:
-        print(f"[employer_dashboard] check_ins fetch error: {e}")
+        print(f"[employer_dashboard] mental_health_reports fetch error: {e}")
         return []
 
 
 def _fetch_sessions(company_id: str, db, days: int = 90) -> List[dict]:
-    """Fetch Diltak session records."""
+    """Fetch chat session records for a company in the last `days` days.
+
+    Reads from `chat_sessions` collection (the actual data source)
+    and normalises fields to the session format the dashboard expects.
+    Uses a TTL cache to avoid duplicate Firestore reads.
+    """
+    cache_key = f"sessions:{company_id}:{days}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     cutoff = utc_now() - timedelta(days=days)
     try:
         docs = (
-            db.collection("sessions")
-            .where("company_id", "==", company_id)
-            .limit(10000)
-            .stream()
-        )
-        results = []
-        for d in docs:
-            data = d.to_dict()
-            ts = _ts_to_dt(data.get("created_at"))
-            if ts and ts >= cutoff:
-                results.append(data)
-        return results
-    except Exception as e:
-        print(f"[employer_dashboard] sessions fetch error: {e}")
-        return []
-
-
-def _fetch_wellness_events(company_id: str, db, days: int = 90) -> List[dict]:
-    try:
-        cutoff = utc_now() - timedelta(days=days)
-        docs = (
-            db.collection("wellness_events")
+            db.collection("chat_sessions")
             .where("company_id", "==", company_id)
             .limit(5000)
             .stream()
@@ -143,21 +206,66 @@ def _fetch_wellness_events(company_id: str, db, days: int = 90) -> List[dict]:
             data = d.to_dict()
             ts = _ts_to_dt(data.get("created_at"))
             if ts and ts >= cutoff:
-                results.append(data)
+                results.append({
+                    "user_id": data.get("employee_id"),
+                    "company_id": company_id,
+                    "created_at": data.get("created_at"),
+                    "duration_minutes": data.get("session_duration_minutes", 5),
+                })
+        _cache_set(cache_key, results)
         return results
     except Exception as e:
-        print(f"[employer_dashboard] wellness_events fetch error: {e}")
+        print(f"[employer_dashboard] chat_sessions fetch error: {e}")
+        return []
+
+
+def _fetch_wellness_events(company_id: str, db, days: int = 90) -> List[dict]:
+    """Derive wellness events from mental health reports.
+
+    High-stress or high-risk reports are mapped to sentiment_negative_shift events
+    since no dedicated wellness_events collection exists.
+    """
+    cutoff = utc_now() - timedelta(days=days)
+    try:
+        docs = (
+            db.collection("mental_health_reports")
+            .where("company_id", "==", company_id)
+            .limit(5000)
+            .stream()
+        )
+        results = []
+        for d in docs:
+            data = d.to_dict()
+            ts = _ts_to_dt(data.get("created_at"))
+            if ts and ts >= cutoff:
+                stress = data.get("stress_level", 5)
+                risk = data.get("risk_level", "low")
+                if stress >= 7 or risk == "high":
+                    results.append({
+                        "event_type": "sentiment_negative_shift",
+                        "company_id": company_id,
+                        "created_at": data.get("created_at"),
+                    })
+        return results
+    except Exception as e:
+        print(f"[employer_dashboard] wellness_events derivation error: {e}")
         return []
 
 
 def _compute_team_size(company_id: str, db) -> int:
+    cache_key = f"team_size:{company_id}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
         docs = (
             db.collection("users")
             .where("company_id", "==", company_id)
             .stream()
         )
-        return sum(1 for _ in docs)
+        size = sum(1 for _ in docs)
+        _cache_set(cache_key, size)
+        return size
     except Exception as e:
         print(f"[employer_dashboard] team size error: {e}")
         return 0
@@ -376,7 +484,7 @@ async def get_wellness_index(
 )
 async def get_burnout_trend(
     company_id: str = Query(...),
-    weeks: int = Query(8, ge=2, le=ROLLING_WEEKS),
+    weeks: int = Query(8, ge=1, le=ROLLING_WEEKS),
     user_token: dict = Depends(get_current_user),
 ):
     profile = _require_employer(user_token)
@@ -577,7 +685,7 @@ async def get_workload_friction(
 )
 async def get_productivity_proxy(
     company_id: str = Query(...),
-    weeks: int = Query(8, ge=2, le=ROLLING_WEEKS),
+    weeks: int = Query(8, ge=1, le=ROLLING_WEEKS),
     user_token: dict = Depends(get_current_user),
 ):
     profile = _require_employer(user_token)
