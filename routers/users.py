@@ -90,6 +90,11 @@ class ListEmployeesResponse(BaseModel):
     employees: List[EmployeeProfile]
     total: int
     companyId: str
+    page: Optional[int] = None
+    limit: Optional[int] = None
+    totalPages: Optional[int] = None
+    hasNext: Optional[bool] = None
+    hasPrev: Optional[bool] = None
 
 
 class UpdateEmployeeResponse(BaseModel):
@@ -289,12 +294,15 @@ async def create_employee(
     "/employees",
     response_model=ListEmployeesResponse,
     summary="List All Employees",
-    description="**Employer / HR only.** Returns all employees in the caller's company.",
+    description="**Employer / HR only.** Returns employees in the caller's company with pagination and search.",
 )
 async def list_employees(
     include_inactive: bool = Query(False, description="Include deactivated accounts"),
     department: Optional[str] = Query(None),
     role_filter: Optional[str] = Query(None, alias="role"),
+    search: Optional[str] = Query(None, description="Search by name, email, department, or job title"),
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    limit: int = Query(20, ge=1, le=100, description="Records per page"),
     employer: dict = Depends(get_employer_user),
 ):
     company_id = employer.get("company_id")
@@ -303,8 +311,11 @@ async def list_employees(
         raise HTTPException(503, "Database unavailable")
 
     try:
+        # Push is_active filter to Firestore so we don't fetch unnecessary docs
         query = db.collection("users").where("company_id", "==", company_id)
-        docs  = query.stream()
+        if not include_inactive:
+            query = query.where("is_active", "==", True)
+        docs = query.stream()
     except Exception as e:
         raise HTTPException(500, f"Database query failed: {e}")
 
@@ -316,23 +327,42 @@ async def list_employees(
         # Skip the employer themselves
         if data.get("role") == "employer":
             continue
-        # Filter inactive
-        if not include_inactive and not data.get("is_active", True):
-            continue
-        # Filter by department
+        # Filter by department (exact match)
         if department and data.get("department", "").lower() != department.lower():
             continue
         # Filter by role
         if role_filter and data.get("role") != role_filter:
             continue
+        # Search across name, email, department, job title
+        if search:
+            term = search.lower().strip()
+            full_name = f"{data.get('first_name', '')} {data.get('last_name', '')}".lower()
+            searchable = " ".join([
+                full_name,
+                data.get("email", "").lower(),
+                data.get("department", "").lower(),
+                data.get("position", "").lower(),
+            ])
+            if term not in searchable:
+                continue
 
         employees.append(_build_profile(uid, data))
 
+    total = len(employees)
+    total_pages = max(1, (total + limit - 1) // limit)
+    offset = (page - 1) * limit
+    page_employees = employees[offset: offset + limit]
+
     return ListEmployeesResponse(
         success=True,
-        employees=employees,
-        total=len(employees),
+        employees=page_employees,
+        total=total,
         companyId=company_id,
+        page=page,
+        limit=limit,
+        totalPages=total_pages,
+        hasNext=offset + limit < total,
+        hasPrev=page > 1,
     )
 
 
@@ -503,6 +533,9 @@ async def _set_employee_active(uid: str, active: bool, employer: dict) -> Deacti
     # Sync disabled status to Firebase Auth
     try:
         fb_auth.update_user(uid, disabled=not active)
+        # Revoke all existing tokens when deactivating so active sessions end immediately
+        if not active:
+            fb_auth.revoke_refresh_tokens(uid)
     except Exception as e:
         print(f"[users] Firebase Auth update_user error: {e}")
 
@@ -638,6 +671,7 @@ class BulkCreateResult(BaseModel):
     success: bool
     uid: Optional[str] = None
     error: Optional[str] = None
+    warnings: Optional[List[str]] = None
 
 
 class BulkCreateResponse(BaseModel):
@@ -708,6 +742,21 @@ async def bulk_create_employees(
             continue
 
         manager_id = item.managerId if item.managerId and item.managerId != "none" else None
+        item_warnings: List[str] = []
+
+        # Validate manager belongs to same company (mirrors single-create validation)
+        if manager_id:
+            try:
+                mgr_doc = db.collection("users").document(manager_id).get()
+                if not mgr_doc.exists or mgr_doc.to_dict().get("company_id") != company_id:
+                    item_warnings.append(
+                        f"Manager '{manager_id}' not found in your company — manager link skipped."
+                    )
+                    manager_id = None
+            except Exception as mgr_err:
+                item_warnings.append(f"Manager validation failed: {mgr_err} — manager link skipped.")
+                manager_id = None
+
         perms = _default_permissions(item.role)
         doc_data: Dict[str, Any] = {
             "id":             uid,
@@ -734,17 +783,38 @@ async def bulk_create_employees(
 
         try:
             db.collection("users").document(uid).set(doc_data)
-            created += 1
-            results.append(BulkCreateResult(email=item.email, success=True, uid=uid))
         except Exception as e:
-            # Rollback auth if Firestore write fails
+            # Firestore write failed — rollback Firebase Auth to avoid orphaned account
             try:
                 fb_auth.delete_user(uid)
             except Exception:
                 pass
             results.append(BulkCreateResult(
-                email=item.email, success=False, error=f"Firestore write failed: {e}"))
+                email=item.email, success=False,
+                error=f"Profile save failed: {e}. Auth account cleaned up."))
             failed += 1
+            continue
+
+        # Update manager's direct_reports list now that employee doc exists
+        if manager_id:
+            try:
+                from google.cloud.firestore_v1 import ArrayUnion
+                db.collection("users").document(manager_id).update({
+                    "direct_reports": ArrayUnion([uid]),
+                    "updated_at":     SERVER_TIMESTAMP,
+                })
+            except Exception as e:
+                item_warnings.append(
+                    f"Employee created but manager's direct_reports could not be updated: {e}"
+                )
+
+        created += 1
+        results.append(BulkCreateResult(
+            email=item.email,
+            success=True,
+            uid=uid,
+            warnings=item_warnings if item_warnings else None,
+        ))
 
     # Update company employee_count once at end
     if created > 0:
