@@ -17,3 +17,5 @@ openpyxl
 chardet
 httpx
 resend
+pdfplumber>=0.10.0
+pypdf>=3.0.0

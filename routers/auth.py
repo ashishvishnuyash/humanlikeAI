@@ -27,8 +27,19 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
     """FastAPI dependency: verify Firebase JWT and return decoded token payload."""
     token = credentials.credentials
     try:
-        decoded_token = fb_auth.verify_id_token(token)
+        decoded_token = fb_auth.verify_id_token(token, check_revoked=True)
         return decoded_token
+    except fb_auth.RevokedIdTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Your session has been revoked. Please log in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except fb_auth.UserDisabledError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account has been deactivated. Please contact your administrator.",
+        )
     except Exception:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -318,6 +329,11 @@ async def login(req: LoginRequest):
         err = resp.json().get("error", {}).get("message", "")
         if err in ("INVALID_LOGIN_CREDENTIALS", "INVALID_PASSWORD", "EMAIL_NOT_FOUND"):
             err = "Invalid email or password."
+        elif err == "USER_DISABLED":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Your account has been deactivated. Please contact your administrator.",
+            )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=err)
 
     data = resp.json()
@@ -331,9 +347,17 @@ async def login(req: LoginRequest):
             doc = db.collection("users").document(uid).get()
             if doc.exists:
                 p = doc.to_dict()
+                # Block deactivated users even if Firebase Auth is still enabled
+                if not p.get("is_active", True):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Your account has been deactivated. Please contact your administrator.",
+                    )
                 role         = p.get("role", "unknown")
                 company_id   = p.get("company_id")
                 company_name = p.get("company_name")
+        except HTTPException:
+            raise
         except Exception as e:
             print(f"[auth] Profile fetch on login error: {e}")
 
