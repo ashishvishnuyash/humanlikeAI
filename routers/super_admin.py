@@ -255,6 +255,9 @@ async def admin_create_employer(
 )
 async def list_employers(
     include_inactive: bool = Query(False),
+    search: Optional[str] = Query(None, description="Search by name, email, or company"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
     _: dict = Depends(get_super_admin_user),
 ):
     db = get_db()
@@ -271,9 +274,30 @@ async def list_employers(
         d = doc.to_dict()
         if not include_inactive and not d.get("is_active", True):
             continue
+        if search:
+            term = search.lower().strip()
+            searchable = " ".join([
+                f"{d.get('first_name', '')} {d.get('last_name', '')}".lower(),
+                d.get("email", "").lower(),
+                d.get("company_name", "").lower(),
+            ])
+            if term not in searchable:
+                continue
         result.append(_safe_profile(d, doc.id))
 
-    return {"employers": result, "total": len(result)}
+    total = len(result)
+    total_pages = max(1, (total + limit - 1) // limit)
+    offset = (page - 1) * limit
+
+    return {
+        "employers": result[offset: offset + limit],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "totalPages": total_pages,
+        "hasNext": offset + limit < total,
+        "hasPrev": page > 1,
+    }
 
 
 # ─── Employers: Get ───────────────────────────────────────────────────────────
@@ -381,6 +405,9 @@ async def list_all_employees(
     company_id:       Optional[str]  = Query(None),
     role_filter:      Optional[str]  = Query(None, alias="role"),
     include_inactive: bool           = Query(False),
+    search:           Optional[str]  = Query(None, description="Search by name, email, or company"),
+    page:             int            = Query(1, ge=1),
+    limit:            int            = Query(20, ge=1, le=100),
     _: dict = Depends(get_super_admin_user),
 ):
     db = get_db()
@@ -405,9 +432,31 @@ async def list_all_employees(
             continue
         if role_filter and role != role_filter:
             continue
+        if search:
+            term = search.lower().strip()
+            searchable = " ".join([
+                f"{d.get('first_name', '')} {d.get('last_name', '')}".lower(),
+                d.get("email", "").lower(),
+                d.get("company_name", "").lower(),
+                d.get("department", "").lower(),
+            ])
+            if term not in searchable:
+                continue
         result.append(_safe_profile(d, doc.id))
 
-    return {"employees": result, "total": len(result)}
+    total = len(result)
+    total_pages = max(1, (total + limit - 1) // limit)
+    offset = (page - 1) * limit
+
+    return {
+        "employees": result[offset: offset + limit],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "totalPages": total_pages,
+        "hasNext": offset + limit < total,
+        "hasPrev": page > 1,
+    }
 
 
 # ─── Employees: Get ───────────────────────────────────────────────────────────
@@ -517,7 +566,12 @@ async def admin_delete_employee(uid: str, _: dict = Depends(get_super_admin_user
 # ─── Companies: List ─────────────────────────────────────────────────────────
 
 @router.get("/companies", summary="List All Companies")
-async def list_all_companies(_: dict = Depends(get_super_admin_user)):
+async def list_all_companies(
+    search: Optional[str] = Query(None, description="Search by company name or industry"),
+    page:   int           = Query(1, ge=1),
+    limit:  int           = Query(20, ge=1, le=100),
+    _: dict = Depends(get_super_admin_user),
+):
     db = get_db()
     if not db:
         raise HTTPException(503, "Database unavailable")
@@ -530,8 +584,14 @@ async def list_all_companies(_: dict = Depends(get_super_admin_user)):
     companies = []
     for doc in docs:
         d = doc.to_dict()
-        ts_created = _ts_to_iso(d.get("created_at"))
-        ts_updated = _ts_to_iso(d.get("updated_at"))
+        if search:
+            term = search.lower().strip()
+            searchable = " ".join([
+                d.get("name", "").lower(),
+                d.get("industry", "").lower(),
+            ])
+            if term not in searchable:
+                continue
         companies.append({
             "id":            doc.id,
             "name":          d.get("name"),
@@ -541,11 +601,23 @@ async def list_all_companies(_: dict = Depends(get_super_admin_user)):
             "employeeCount": d.get("employee_count", 0),
             "website":       d.get("website"),
             "description":   d.get("description"),
-            "createdAt":     ts_created,
-            "updatedAt":     ts_updated,
+            "createdAt":     _ts_to_iso(d.get("created_at")),
+            "updatedAt":     _ts_to_iso(d.get("updated_at")),
         })
 
-    return {"companies": companies, "total": len(companies)}
+    total = len(companies)
+    total_pages = max(1, (total + limit - 1) // limit)
+    offset = (page - 1) * limit
+
+    return {
+        "companies": companies[offset: offset + limit],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "totalPages": total_pages,
+        "hasNext": offset + limit < total,
+        "hasPrev": page > 1,
+    }
 
 
 # ─── Companies: Get ───────────────────────────────────────────────────────────
@@ -792,6 +864,9 @@ async def _set_user_active(uid: str, active: bool, role_check: str) -> MutationR
 
     try:
         fb_auth.update_user(uid, disabled=not active)
+        # Revoke all existing tokens when deactivating so active sessions end immediately
+        if not active:
+            fb_auth.revoke_refresh_tokens(uid)
     except Exception as e:
         print(f"[admin] Firebase Auth toggle error: {e}")
 
