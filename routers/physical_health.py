@@ -853,7 +853,12 @@ async def ask_medical_question(
         chunks = store.retrieve(
             query=req.question,
             top_k=4,
-            metadata_filter={"user_id": uid, "type": "medical_report"},
+            metadata_filter={
+                "$and": [
+                    {"user_id": {"$eq": uid}},
+                    {"type": {"$eq": "medical_report"}},
+                ]
+            },
         )
     except Exception as e:
         raise HTTPException(500, f"Knowledge retrieval failed: {e}")
