@@ -249,7 +249,12 @@ def generate_periodic_report(
         chunks = store.retrieve(
             query="health findings lab results blood test medical report",
             top_k=4,
-            metadata_filter={"user_id": user_id, "type": "medical_report"},
+            metadata_filter={
+                "$and": [
+                    {"user_id": {"$eq": user_id}},
+                    {"type": {"$eq": "medical_report"}},
+                ]
+            },
         )
         if chunks:
             medical_context = "\n\n".join(c["text"] for c in chunks)
