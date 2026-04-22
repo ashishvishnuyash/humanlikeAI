@@ -7,3 +7,10 @@ __pycache__/
 venv/
 
 firebaseadmn.json
+
+# Alembic local artifacts (committed migrations live under alembic/versions/ — only ignore caches)
+alembic/__pycache__/
+
+# Azure local dev artifacts
+.azurite/
+azurite-data/
