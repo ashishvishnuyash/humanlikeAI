@@ -59,6 +59,10 @@ Company.__table__.append_constraint(
         ["users.id"],
         ondelete="SET NULL",
         name="fk_companies_owner_id_users",
+        # use_alter=True emits this FK as a separate ALTER TABLE after both
+        # tables exist — necessary because Company is created before User in
+        # FK-resolution order, but references User.
+        use_alter=True,
     )
 )
 
