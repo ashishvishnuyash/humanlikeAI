@@ -121,8 +121,11 @@ def test_transform_user_preserves_firebase_uid_as_id():
     # Extras folded into profile; denormalized `direct_reports` dropped entirely
     assert row["profile"]["display_name"] == "Alice"
     assert "direct_reports" not in row["profile"]
-    # password_hash is None — users will reset on first login post-cutover
-    assert row["password_hash"] is None
+    # Every migrated user gets the default password "11111111".
+    from auth.password import verify_password
+    assert row["password_hash"] is not None
+    assert row["password_hash"].startswith(("$2a$", "$2b$", "$2y$"))
+    assert verify_password("11111111", row["password_hash"]) is True
 
 
 def test_transform_user_missing_email_raises():

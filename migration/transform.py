@@ -16,6 +16,8 @@ import sys
 import uuid
 from typing import Iterable, Tuple
 
+from auth.password import hash_password
+
 
 class MissingRequiredField(ValueError):
     """Raised when a required field is missing from a source document."""
@@ -24,6 +26,14 @@ class MissingRequiredField(ValueError):
 # Namespace UUID for deterministic conversion of arbitrary doc IDs to UUIDs.
 # Stable across runs; must not change or existing rows would be orphaned.
 _NS = uuid.UUID("2f8b0f5a-1d8e-4a1a-9b00-000000000001")
+
+
+# Every migrated user starts with this default password. Users are expected to
+# change it on first login. Hashed once at module load (bcrypt is ~300 ms per
+# call; one hash shared across all migrated rows is fine — salt doesn't add
+# security when the plaintext is identical for everyone anyway).
+DEFAULT_MIGRATED_PASSWORD = "11111111"
+_DEFAULT_PASSWORD_HASH = hash_password(DEFAULT_MIGRATED_PASSWORD)
 
 
 def coerce_uuid(value) -> uuid.UUID:
@@ -111,7 +121,7 @@ def transform_user(doc_id: str, doc: dict) -> dict:
     return {
         "id": doc_id,  # preserve Firebase UID verbatim
         "email": known["email"],
-        "password_hash": None,  # users reset on first login post-cutover
+        "password_hash": _DEFAULT_PASSWORD_HASH,  # default password "11111111" — users change on first login
         "role": known.get("role") or "employee",
         "company_id": company_id,
         "manager_id": known.get("manager_id"),
