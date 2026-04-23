@@ -13,11 +13,12 @@ Flow:
   2. File is parsed + validated synchronously (no Firebase calls)
   3. If errors → return 400 with full error list immediately
   4. If dry_run=True → return validation preview, no job created
-  5. If valid → create Firestore job doc, kick off background worker, return 202
-  6. Background worker creates Firebase Auth accounts, generates invite links,
-     sends emails, writes Firestore user docs, updates job progress
+  5. If valid → create Postgres import_jobs row, kick off background worker, return 202
+  6. Background worker creates user rows, generates invite links,
+     sends emails, and updates job progress
   7. Employer polls GET /{job_id} for live progress
   8. On completion, a results CSV is generated and stored in Firebase Storage
+     (Firebase Storage kept until Phase 5 — see TODO comments below)
 """
 
 from __future__ import annotations
@@ -25,16 +26,18 @@ from __future__ import annotations
 import csv
 import io
 import os
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
-from firebase_admin import auth as fb_auth
-from google.cloud.firestore_v1 import SERVER_TIMESTAMP, ArrayUnion
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
-from firebase_config import get_db
+from db.session import get_session
+from db.models.user import User
+from db.models.company import Company
 from routers.auth import get_employer_user
 from utils.import_parser import ParsedEmployee, parse_file
 from utils.import_jobs import (
@@ -266,35 +269,48 @@ async def run_import_job(
     employer: dict,
 ) -> None:
     """
-    Background task: create Firebase Auth accounts, generate invite links,
-    send emails, write Firestore user docs, and update job progress.
+    Background task: create Postgres user rows, generate invite links,
+    send emails, and update job progress.
     One bad row never aborts the whole job.
     """
+    from db.session import get_session_factory
+
     update_job(job_id, status=STATUS_CREATING)
 
-    db = get_db()
-    company_id   = employer.get("company_id", "")
-    company_name = employer.get("company_name", "")
-    employer_uid = employer.get("id", employer.get("uid", ""))
-    employer_name = employer.get("display_name", "")
+    company_id_str = employer.get("company_id", "")
+    company_name   = employer.get("company_name", "")
+    employer_uid   = employer.get("id", employer.get("uid", ""))
+    employer_name  = employer.get("display_name", "")
+
+    try:
+        company_uuid = uuid.UUID(company_id_str)
+    except (ValueError, AttributeError):
+        update_job(job_id, status=STATUS_FAILED)
+        print(f"[import_job] Invalid company_id UUID: {company_id_str!r}")
+        return
 
     created_count = 0
     failed_count  = 0
     skipped_count = 0
     batch_results: List[dict] = []
 
+    SessionLocal = get_session_factory()
+
     # ── Build email → uid map for existing company members ───────────────────
     # Used to resolve manager_email → manager_id
     email_to_uid: Dict[str, str] = {}
-    if db:
-        try:
-            existing = db.collection("users").where("company_id", "==", company_id).stream()
-            for doc in existing:
-                d = doc.to_dict()
-                if d.get("email"):
-                    email_to_uid[d["email"].lower()] = doc.id
-        except Exception as e:
-            print(f"[import_job] Could not pre-load email map: {e}")
+    try:
+        with SessionLocal() as db:
+            existing = (
+                db.query(User)
+                .filter(User.company_id == company_uuid)
+                .all()
+            )
+            for u in existing:
+                if u.email:
+                    email_to_uid[u.email.lower()] = u.id
+    except Exception as e:
+        print(f"[import_job] Could not pre-load email map: {e}")
 
     # Also track emails created in this job (for intra-file manager resolution)
     created_in_job: Dict[str, str] = {}   # email → uid
@@ -314,100 +330,98 @@ async def run_import_job(
         }
 
         try:
-            # ── Check if email already exists in Firebase ─────────────────────
-            try:
-                fb_auth.get_user_by_email(row.email)
-                # Already exists — skip
+            # ── Check if email already exists in Postgres ─────────────────────
+            with SessionLocal() as db:
+                existing_user = (
+                    db.query(User)
+                    .filter(User.email == row.email)
+                    .one_or_none()
+                )
+
+            if existing_user is not None:
                 result_entry["status"] = "skipped_duplicate"
-                result_entry["error"]  = "Email already registered in Firebase."
+                result_entry["error"]  = "Email already registered."
                 skipped_count += 1
                 batch_results.append(result_entry)
                 continue
-            except fb_auth.UserNotFoundError:
-                pass   # Good — proceed to create
 
-            # ── Create Firebase Auth account (no password) ────────────────────
-            fb_user = fb_auth.create_user(
-                email=row.email,
-                display_name=f"{row.first_name} {row.last_name}",
-                email_verified=False,
-            )
-            uid = fb_user.uid
+            # ── Generate UID (no Firebase Auth — user resets password on first login) ──
+            uid = str(uuid.uuid4())
             result_entry["uid"] = uid
             created_in_job[row.email] = uid
 
-            # ── Generate secure invite link ───────────────────────────────────
-            invite_link = fb_auth.generate_password_reset_link(row.email)
+            # ── Generate invite link via Firebase (kept until Phase 5) ────────
+            # TODO: Phase 5 - Azure Blob / Azure AD B2C invite link generation
+            from firebase_admin import auth as fb_auth  # TODO: Phase 5 - Azure Blob
+            invite_link = fb_auth.generate_password_reset_link(row.email)  # TODO: Phase 5 - Azure Blob
 
             # ── Resolve manager_email → manager_id ────────────────────────────
             manager_id: Optional[str] = None
-            manager_level: Optional[int] = None
 
             if row.manager_email:
                 mgr_uid = (
-                    email_to_uid.get(row.manager_email)
+                    email_to_uid.get(row.manager_email.lower())
                     or created_in_job.get(row.manager_email)
                 )
                 if mgr_uid:
                     manager_id = mgr_uid
-                    # Get manager's hierarchy level for auto-assignment
-                    if db:
-                        try:
-                            mgr_doc = db.collection("users").document(mgr_uid).get()
-                            if mgr_doc.exists:
-                                manager_level = mgr_doc.to_dict().get("hierarchy_level")
-                        except Exception:
-                            pass
                 else:
-                    print(f"[import_job] row {row.row_number}: manager_email {row.manager_email!r} not found — skipping manager link")
+                    print(
+                        f"[import_job] row {row.row_number}: "
+                        f"manager_email {row.manager_email!r} not found — skipping manager link"
+                    )
 
             # ── Compute hierarchy_level ───────────────────────────────────────
             hierarchy_level = row.hierarchy_level
             if hierarchy_level is None:
-                hierarchy_level = (manager_level + 1) if manager_level else 1
+                # Attempt to derive from manager
+                if manager_id:
+                    try:
+                        with SessionLocal() as db:
+                            mgr = db.get(User, manager_id)
+                            mgr_level = (mgr.profile or {}).get("hierarchy_level") if mgr else None
+                            hierarchy_level = (mgr_level + 1) if mgr_level else 1
+                    except Exception:
+                        hierarchy_level = 1
+                else:
+                    hierarchy_level = 1
 
             # ── Build default permissions ─────────────────────────────────────
             perms = _default_permissions(row.role)
 
-            # ── Write Firestore user document ─────────────────────────────────
-            doc_data: Dict[str, Any] = {
-                "id":              uid,
-                "email":           row.email,
+            # ── Write Postgres user row ───────────────────────────────────────
+            profile: Dict[str, Any] = {
                 "first_name":      row.first_name,
                 "last_name":       row.last_name,
                 "display_name":    f"{row.first_name} {row.last_name}",
-                "role":            row.role,
-                "department":      row.department,
                 "position":        row.position,
                 "phone":           row.phone,
-                "company_id":      company_id,
                 "company_name":    company_name,
-                "manager_id":      manager_id,
                 "hierarchy_level": hierarchy_level,
-                "direct_reports":  [],
                 "reporting_chain": [],
-                "is_active":       True,
                 "created_by":      employer_uid,
                 "import_job_id":   job_id,
-                "created_at":      SERVER_TIMESTAMP,
-                "updated_at":      SERVER_TIMESTAMP,
                 **perms,
             }
 
-            if db:
-                db.collection("users").document(uid).set(doc_data)
-                # Add uid to email_to_uid so later rows in same file can resolve this as manager
-                email_to_uid[row.email] = uid
+            new_user = User(
+                id=uid,
+                email=row.email,
+                password_hash=None,   # user sets password via invite link on first login
+                role=row.role,
+                company_id=company_uuid,
+                manager_id=manager_id,
+                department=row.department,
+                is_active=True,
+                profile=profile,
+            )
 
-                # Update manager's direct_reports list
-                if manager_id:
-                    try:
-                        db.collection("users").document(manager_id).update({
-                            "direct_reports": ArrayUnion([uid]),
-                            "updated_at":     SERVER_TIMESTAMP,
-                        })
-                    except Exception as e:
-                        print(f"[import_job] direct_reports update error for manager {manager_id}: {e}")
+            with SessionLocal() as db:
+                db.add(new_user)
+                db.commit()
+
+            # Register in local maps so later rows in same file can resolve this as a manager
+            email_to_uid[row.email.lower()] = uid
 
             # ── Send invite email ─────────────────────────────────────────────
             invite_sent = send_invite_email(
@@ -428,14 +442,6 @@ async def run_import_job(
         except Exception as e:
             err_msg = str(e)
             print(f"[import_job] row {row.row_number} ({row.email}) failed: {err_msg}")
-
-            # Rollback Firebase Auth user if Firestore write failed
-            if result_entry.get("uid"):
-                try:
-                    fb_auth.delete_user(result_entry["uid"])
-                except Exception:
-                    pass
-
             result_entry["error"] = err_msg
             failed_count += 1
 
@@ -460,20 +466,20 @@ async def run_import_job(
         flush_results(job_id, batch_results)
 
     # ── Increment company employee_count ──────────────────────────────────────
-    if created_count > 0 and db:
+    if created_count > 0:
         try:
-            from firebase_admin import firestore as admin_firestore
-            db.collection("companies").document(company_id).update({
-                "employee_count": admin_firestore.firestore.Increment(created_count),
-                "updated_at":     SERVER_TIMESTAMP,
-            })
+            with SessionLocal() as db:
+                db.query(Company).filter(Company.id == company_uuid).update(
+                    {"employee_count": Company.employee_count + created_count}
+                )
+                db.commit()
         except Exception as e:
             print(f"[import_job] company count update error: {e}")
 
     # ── Generate results CSV and upload to Firebase Storage ───────────────────
     results_csv_url = None
     try:
-        results_csv_url = await _upload_results_csv(job_id, company_id)
+        results_csv_url = await _upload_results_csv(job_id, company_id_str)
     except Exception as e:
         print(f"[import_job] results CSV upload error: {e}")
 
@@ -514,13 +520,15 @@ async def get_import_status(
     if job.get("company_id") != employer.get("company_id"):
         raise HTTPException(403, "Access denied.")
 
-    total    = job.get("total_rows", 0)
+    total     = job.get("total_rows", 0)
     processed = job.get("processed", 0)
-    progress = round((processed / total * 100) if total > 0 else 0, 1)
+    progress  = round((processed / total * 100) if total > 0 else 0, 1)
 
     def _ts(val) -> Optional[str]:
         if val is None:
             return None
+        if isinstance(val, datetime):
+            return val.astimezone(timezone.utc).isoformat()
         if hasattr(val, "timestamp"):
             return datetime.fromtimestamp(val.timestamp(), tz=timezone.utc).isoformat()
         return str(val)
@@ -547,7 +555,7 @@ async def get_import_status(
     response_model=ResendInvitesResponse,
     summary="Resend Invite Emails",
     description=(
-        "Regenerate Firebase invite links and resend emails for employees whose "
+        "Regenerate invite links and resend emails for employees whose "
         "invite was not sent. Pass specific emails to target them, or omit to resend all failed invites."
     ),
 )
@@ -555,6 +563,7 @@ async def resend_invites(
     job_id: str,
     req: ResendInvitesRequest,
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
     job = get_job(job_id)
     if not job:
@@ -585,15 +594,16 @@ async def resend_invites(
     failed = 0
     details: List[dict] = []
 
-    db = get_db()
-
     for entry in to_resend:
         email      = entry["email"]
         first_name = entry.get("first_name", "")
         detail: dict = {"email": email, "success": False}
 
         try:
-            invite_link = fb_auth.generate_password_reset_link(email)
+            # TODO: Phase 5 - Azure Blob / Azure AD B2C invite link generation
+            from firebase_admin import auth as fb_auth  # TODO: Phase 5 - Azure Blob
+            invite_link = fb_auth.generate_password_reset_link(email)  # TODO: Phase 5 - Azure Blob
+
             sent = send_invite_email(
                 to_email=email,
                 first_name=first_name,
@@ -604,20 +614,22 @@ async def resend_invites(
             if sent:
                 resent += 1
                 detail["success"] = True
-                # Update invite_sent flag in the job results array
-                # (Firestore doesn't support updating array items in place;
-                #  we reload, patch, and write back)
-                if db:
-                    try:
-                        job_ref = db.collection("import_jobs").document(job_id)
-                        fresh   = job_ref.get().to_dict() or {}
-                        updated_results = fresh.get("results", [])
+                # Update invite_sent flag for this email in the job's results array
+                try:
+                    from utils.import_jobs import flush_results as _flush
+                    from db.models.imports import ImportJob
+                    import uuid as _uuid
+                    job_obj = db.get(ImportJob, _uuid.UUID(job_id))
+                    if job_obj is not None:
+                        updated_results = list(job_obj.errors or [])
                         for r in updated_results:
                             if r.get("email") == email:
                                 r["invite_sent"] = True
-                        job_ref.update({"results": updated_results, "updated_at": SERVER_TIMESTAMP})
-                    except Exception as e:
-                        print(f"[resend_invites] result flag update error: {e}")
+                        job_obj.errors = updated_results
+                        db.add(job_obj)
+                        db.commit()
+                except Exception as e:
+                    print(f"[resend_invites] result flag update error: {e}")
             else:
                 failed += 1
                 detail["error"] = "Email delivery failed."
@@ -654,21 +666,22 @@ async def _upload_results_csv(job_id: str, company_id: str) -> Optional[str]:
     csv_bytes = buf.getvalue().encode("utf-8")
 
     # Upload to Firebase Storage
+    # TODO: Phase 5 - Azure Blob (replace Firebase Storage with Azure Blob Storage)
     bucket_name = os.environ.get("FIREBASE_STORAGE_BUCKET")
     if not bucket_name:
         print("[import_job] FIREBASE_STORAGE_BUCKET not set — skipping results CSV upload")
         return None
 
     try:
-        from firebase_admin import storage
+        from firebase_admin import storage  # TODO: Phase 5 - Azure Blob
         import datetime as dt
 
-        bucket = storage.bucket(bucket_name)
-        blob   = bucket.blob(f"import_results/{company_id}/{job_id}.csv")
-        blob.upload_from_string(csv_bytes, content_type="text/csv")
+        bucket = storage.bucket(bucket_name)  # TODO: Phase 5 - Azure Blob
+        blob   = bucket.blob(f"import_results/{company_id}/{job_id}.csv")  # TODO: Phase 5 - Azure Blob
+        blob.upload_from_string(csv_bytes, content_type="text/csv")  # TODO: Phase 5 - Azure Blob
 
         # Signed URL valid for 7 days
-        url = blob.generate_signed_url(
+        url = blob.generate_signed_url(  # TODO: Phase 5 - Azure Blob
             expiration=dt.timedelta(days=7),
             method="GET",
         )
