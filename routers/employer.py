@@ -8,27 +8,25 @@ Employer CRUD — Full profile & company management
   GET    /api/employer/company/stats    → Company summary stats (headcount, roles, depts)
   DELETE /api/employer/account          → Permanently delete employer account + company
                                           ⚠  Requires confirmation_phrase in body
-  POST   /api/employer/change-password  → Change own password via Firebase Auth REST API
+  POST   /api/employer/change-password  → Change own password via bcrypt verify + Postgres update
 
 All endpoints require JWT with role == employer (only the account owner).
 HR users can read profile/company but cannot mutate or delete.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
-from firebase_admin import auth as fb_auth, firestore as admin_firestore
-from firebase_config import get_db, firebaseConfig
-from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 from pydantic import BaseModel, EmailStr
+from sqlalchemy.orm import Session
 
+from auth.password import hash_password, verify_password
+from db.models import Company, User
+from db.session import get_session
 from routers.auth import get_current_user, get_employer_user
 
 router = APIRouter(prefix="/employer", tags=["Employer CRUD"])
-
-_Increment = admin_firestore.firestore.Increment
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -53,6 +51,26 @@ def _require_owner(employer: dict, expected_role: str = "employer") -> None:
                 f"Your role: '{employer.get('role', 'unknown')}'."
             ),
         )
+
+
+def _company_to_response(company: Company) -> "CompanyResponse":
+    """Map a Company ORM instance to CompanyResponse using settings JSONB for extended fields."""
+    s = company.settings or {}
+    return CompanyResponse(
+        id=str(company.id),
+        name=company.name,
+        industry=s.get("industry"),
+        size=s.get("size"),
+        ownerId=company.owner_id or "",
+        employeeCount=company.employee_count,
+        website=s.get("website"),
+        address=s.get("address"),
+        phone=s.get("phone"),
+        description=s.get("description"),
+        logoUrl=s.get("logo_url"),
+        createdAt=_ts_to_iso(company.created_at),
+        updatedAt=_ts_to_iso(company.updated_at),
+    )
 
 
 # ─── Schemas ─────────────────────────────────────────────────────────────────
@@ -145,32 +163,36 @@ class MutationResponse(BaseModel):
     summary="Get Employer Profile",
     description="Returns the caller's full employer profile, with embedded company document.",
 )
-async def get_employer_profile(employer: dict = Depends(get_employer_user)):
-    db = get_db()
-    company_id = employer.get("company_id", "")
+async def get_employer_profile(
+    employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
+):
+    company_id_str = employer.get("company_id", "")
     company_doc = None
 
-    if db and company_id:
+    if company_id_str:
         try:
-            cdoc = db.collection("companies").document(company_id).get()
-            if cdoc.exists:
-                raw = cdoc.to_dict()
+            import uuid as _uuid
+            cid = _uuid.UUID(company_id_str)
+            company = db.query(Company).filter(Company.id == cid).one_or_none()
+            if company is not None:
+                s = company.settings or {}
                 company_doc = {
-                    "id":            raw.get("id", company_id),
-                    "name":          raw.get("name"),
-                    "industry":      raw.get("industry"),
-                    "size":          raw.get("size"),
-                    "ownerId":       raw.get("owner_id"),
-                    "employeeCount": raw.get("employee_count", 0),
-                    "website":       raw.get("website"),
-                    "address":       raw.get("address"),
-                    "phone":         raw.get("phone"),
-                    "description":   raw.get("description"),
-                    "logoUrl":       raw.get("logo_url"),
-                    "createdAt":     _ts_to_iso(raw.get("created_at")),
-                    "updatedAt":     _ts_to_iso(raw.get("updated_at")),
+                    "id":            str(company.id),
+                    "name":          company.name,
+                    "industry":      s.get("industry"),
+                    "size":          s.get("size"),
+                    "ownerId":       company.owner_id,
+                    "employeeCount": company.employee_count,
+                    "website":       s.get("website"),
+                    "address":       s.get("address"),
+                    "phone":         s.get("phone"),
+                    "description":   s.get("description"),
+                    "logoUrl":       s.get("logo_url"),
+                    "createdAt":     _ts_to_iso(company.created_at),
+                    "updatedAt":     _ts_to_iso(company.updated_at),
                 }
-        except Exception as e:
+        except (ValueError, Exception) as e:
             print(f"[employer] company fetch error: {e}")
 
     perms = {k: employer.get(k, False) for k in (
@@ -188,7 +210,7 @@ async def get_employer_profile(employer: dict = Depends(get_employer_user)):
         role=employer.get("role", "employer"),
         jobTitle=employer.get("job_title"),
         phone=employer.get("phone"),
-        companyId=company_id,
+        companyId=company_id_str,
         companyName=employer.get("company_name", ""),
         isActive=employer.get("is_active", True),
         hierarchyLevel=employer.get("hierarchy_level", 0),
@@ -210,14 +232,13 @@ async def get_employer_profile(employer: dict = Depends(get_employer_user)):
 async def update_employer_profile(
     req: UpdateEmployerProfileRequest,
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
     _require_owner(employer)
     uid = employer.get("id")
-    db  = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
 
-    updates: Dict[str, Any] = {"updated_at": SERVER_TIMESTAMP}
+    # Build the profile JSONB patch — only include fields that were provided
+    profile_updates: Dict[str, Any] = {}
     updated_fields: List[str] = []
 
     field_map = {
@@ -226,26 +247,29 @@ async def update_employer_profile(
         "phone":     "phone",
         "jobTitle":  "job_title",
     }
-    for req_field, db_field in field_map.items():
+    for req_field, profile_key in field_map.items():
         val = getattr(req, req_field, None)
         if val is not None:
-            updates[db_field] = val
+            profile_updates[profile_key] = val
             updated_fields.append(req_field)
 
-    if len(updates) == 1:
+    if not profile_updates:
         raise HTTPException(400, "No valid fields provided to update.")
 
     # Rebuild display_name if name changed
-    if "first_name" in updates or "last_name" in updates:
-        fn = updates.get("first_name", employer.get("first_name", ""))
-        ln = updates.get("last_name",  employer.get("last_name",  ""))
-        updates["display_name"] = f"{fn} {ln}"
-        try:
-            fb_auth.update_user(uid, display_name=updates["display_name"])
-        except Exception as e:
-            print(f"[employer] Firebase display_name sync error: {e}")
+    if "first_name" in profile_updates or "last_name" in profile_updates:
+        fn = profile_updates.get("first_name", employer.get("first_name", ""))
+        ln = profile_updates.get("last_name",  employer.get("last_name",  ""))
+        profile_updates["display_name"] = f"{fn} {ln}"
 
-    db.collection("users").document(uid).update(updates)
+    # Merge the new values into the existing profile JSONB
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
+        raise HTTPException(404, "User not found.")
+    merged = dict(user.profile or {})
+    merged.update(profile_updates)
+    user.profile = merged
+    db.commit()
 
     return MutationResponse(
         success=True,
@@ -262,35 +286,25 @@ async def update_employer_profile(
     summary="Get Company Details",
     description="Returns the full company document for the employer's company.",
 )
-async def get_company(employer: dict = Depends(get_employer_user)):
-    company_id = employer.get("company_id")
-    if not company_id:
+async def get_company(
+    employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
+):
+    company_id_str = employer.get("company_id")
+    if not company_id_str:
         raise HTTPException(404, "No company associated with this account.")
 
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    import uuid as _uuid
+    try:
+        cid = _uuid.UUID(company_id_str)
+    except ValueError:
+        raise HTTPException(400, "Invalid company ID.")
 
-    cdoc = db.collection("companies").document(company_id).get()
-    if not cdoc.exists:
+    company = db.query(Company).filter(Company.id == cid).one_or_none()
+    if company is None:
         raise HTTPException(404, "Company not found.")
 
-    raw = cdoc.to_dict()
-    return CompanyResponse(
-        id=raw.get("id", company_id),
-        name=raw.get("name", ""),
-        industry=raw.get("industry"),
-        size=raw.get("size"),
-        ownerId=raw.get("owner_id", ""),
-        employeeCount=raw.get("employee_count", 0),
-        website=raw.get("website"),
-        address=raw.get("address"),
-        phone=raw.get("phone"),
-        description=raw.get("description"),
-        logoUrl=raw.get("logo_url"),
-        createdAt=_ts_to_iso(raw.get("created_at")),
-        updatedAt=_ts_to_iso(raw.get("updated_at")),
-    )
+    return _company_to_response(company)
 
 
 # ─── PATCH /employer/company ──────────────────────────────────────────────────
@@ -307,25 +321,32 @@ async def get_company(employer: dict = Depends(get_employer_user)):
 async def update_company(
     req: UpdateCompanyRequest,
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
     _require_owner(employer)
-    company_id = employer.get("company_id")
-    if not company_id:
+    company_id_str = employer.get("company_id")
+    if not company_id_str:
         raise HTTPException(400, "Employer has no associated company_id.")
 
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    import uuid as _uuid
+    try:
+        cid = _uuid.UUID(company_id_str)
+    except ValueError:
+        raise HTTPException(400, "Invalid company ID.")
 
-    cdoc = db.collection("companies").document(company_id).get()
-    if not cdoc.exists:
+    company = db.query(Company).filter(Company.id == cid).one_or_none()
+    if company is None:
         raise HTTPException(404, "Company document not found.")
 
-    updates: Dict[str, Any] = {"updated_at": SERVER_TIMESTAMP}
     updated_fields: List[str] = []
 
-    field_map = {
-        "name":        "name",
+    # Top-level column: name
+    if req.name is not None:
+        company.name = req.name
+        updated_fields.append("name")
+
+    # Extended fields stored in settings JSONB
+    settings_map = {
         "industry":    "industry",
         "size":        "size",
         "website":     "website",
@@ -334,27 +355,18 @@ async def update_company(
         "description": "description",
         "logoUrl":     "logo_url",
     }
-    for req_field, db_field in field_map.items():
+    new_settings = dict(company.settings or {})
+    for req_field, settings_key in settings_map.items():
         val = getattr(req, req_field, None)
         if val is not None:
-            updates[db_field] = val
+            new_settings[settings_key] = val
             updated_fields.append(req_field)
 
-    if len(updates) == 1:
+    if not updated_fields:
         raise HTTPException(400, "No valid fields provided to update.")
 
-    db.collection("companies").document(company_id).update(updates)
-
-    # If name changed, sync to employer user profile too
-    if "name" in updates:
-        uid = employer.get("id")
-        try:
-            db.collection("users").document(uid).update({
-                "company_name": updates["name"],
-                "updated_at":   SERVER_TIMESTAMP,
-            })
-        except Exception as e:
-            print(f"[employer] company_name sync to user failed: {e}")
+    company.settings = new_settings
+    db.commit()
 
     return MutationResponse(
         success=True,
@@ -374,47 +386,61 @@ async def update_company(
         "department breakdown, and recent joins (last 30 days) for the employer's company."
     ),
 )
-async def get_company_stats(employer: dict = Depends(get_employer_user)):
-    company_id = employer.get("company_id")
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+async def get_company_stats(
+    employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
+):
+    company_id_str = employer.get("company_id")
+
+    import uuid as _uuid
+    if not company_id_str:
+        raise HTTPException(400, "Employer has no associated company_id.")
+    try:
+        cid = _uuid.UUID(company_id_str)
+    except ValueError:
+        raise HTTPException(400, "Invalid company ID.")
 
     try:
-        docs = db.collection("users").where("company_id", "==", company_id).stream()
+        users = (
+            db.query(User)
+            .filter(User.company_id == cid)
+            .all()
+        )
     except Exception as e:
         raise HTTPException(500, f"Database query failed: {e}")
 
     now = datetime.now(timezone.utc)
-    thirty_days_ago_ts = now.timestamp() - (30 * 86400)
+    thirty_days_ago = now - timedelta(days=30)
 
     total = active = inactive = recent_joins = 0
     roles: Dict[str, int] = {}
     depts: Dict[str, int] = {}
 
-    for doc in docs:
-        d = doc.to_dict()
-        if d.get("role") == "employer":
+    for user in users:
+        if user.role == "employer":
             continue   # don't count the owner in employee stats
         total += 1
-        if d.get("is_active", True):
+        if user.is_active:
             active += 1
         else:
             inactive += 1
 
-        role = d.get("role", "unknown")
+        role = user.role or "unknown"
         roles[role] = roles.get(role, 0) + 1
 
-        dept = d.get("department") or "Unassigned"
+        dept = user.department or "Unassigned"
         depts[dept] = depts.get(dept, 0) + 1
 
-        created_ts = d.get("created_at")
-        if created_ts and hasattr(created_ts, "timestamp"):
-            if created_ts.timestamp() >= thirty_days_ago_ts:
+        created_at = user.created_at
+        if created_at is not None:
+            # Ensure timezone-aware comparison
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            if created_at >= thirty_days_ago:
                 recent_joins += 1
 
     return CompanyStatsResponse(
-        companyId=company_id,
+        companyId=company_id_str,
         totalEmployees=total,
         activeEmployees=active,
         inactiveEmployees=inactive,
@@ -432,13 +458,14 @@ async def get_company_stats(employer: dict = Depends(get_employer_user)):
     response_model=MutationResponse,
     summary="Change Employer Password",
     description=(
-        "Re-authenticates via Firebase REST API, then updates the password. "
+        "Re-authenticates via bcrypt, then updates the password in Postgres. "
         "New password must be at least 8 characters."
     ),
 )
 async def change_password(
     req: ChangePasswordRequest,
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
     _require_owner(employer)
 
@@ -448,30 +475,17 @@ async def change_password(
     if req.current_password == req.new_password:
         raise HTTPException(400, "New password must be different from the current password.")
 
-    api_key = firebaseConfig.get("apiKey")
-    if not api_key:
-        raise HTTPException(500, "Server misconfiguration: Missing Firebase API Key.")
+    uid = employer.get("id")
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
+        raise HTTPException(404, "User not found.")
 
-    email = employer.get("email", "")
-
-    # Step 1: Re-authenticate with current password
-    verify_url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={api_key}"
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(verify_url, json={
-            "email":             email,
-            "password":          req.current_password,
-            "returnSecureToken": False,
-        })
-
-    if resp.status_code != 200:
+    # Re-authenticate: verify current password against stored hash
+    if user.password_hash is None or not verify_password(req.current_password, user.password_hash):
         raise HTTPException(401, "Current password is incorrect.")
 
-    # Step 2: Update password in Firebase Auth
-    uid = employer.get("id")
-    try:
-        fb_auth.update_user(uid, password=req.new_password)
-    except Exception as e:
-        raise HTTPException(500, f"Password update failed: {e}")
+    user.password_hash = hash_password(req.new_password)
+    db.commit()
 
     return MutationResponse(
         success=True,
@@ -486,14 +500,15 @@ async def change_password(
     response_model=MutationResponse,
     summary="Delete Employer Account",
     description=(
-        "⚠️ **Irreversible.** Permanently deletes the employer's Firebase Auth account, "
-        "user profile, and company document. All employee accounts remain intact. "
+        "**Irreversible.** Permanently deletes the employer's Postgres user row "
+        "and company document. Employee company_id FKs are SET NULL on cascade. "
         "Requires `confirmation_phrase = 'DELETE MY ACCOUNT'` and the current `password`."
     ),
 )
 async def delete_employer_account(
     req: DeleteAccountRequest,
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
     _require_owner(employer)
 
@@ -503,57 +518,28 @@ async def delete_employer_account(
             "Confirmation phrase must be exactly: DELETE MY ACCOUNT",
         )
 
-    # Re-authenticate before destructive action
-    api_key = firebaseConfig.get("apiKey")
-    if not api_key:
-        raise HTTPException(500, "Server misconfiguration: Missing Firebase API Key.")
+    uid = employer.get("id")
+    company_id_str = employer.get("company_id")
 
-    email = employer.get("email", "")
-    verify_url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={api_key}"
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(verify_url, json={
-            "email":             email,
-            "password":          req.password,
-            "returnSecureToken": False,
-        })
-
-    if resp.status_code != 200:
+    # Re-authenticate: verify password before destructive action
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
+        raise HTTPException(404, "User not found.")
+    if user.password_hash is None or not verify_password(req.password, user.password_hash):
         raise HTTPException(401, "Password is incorrect. Account deletion aborted.")
 
-    uid        = employer.get("id")
-    company_id = employer.get("company_id")
-    db         = get_db()
-
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
-    errors = []
-
-    # 1. Delete Firestore user profile
-    try:
-        db.collection("users").document(uid).delete()
-    except Exception as e:
-        errors.append(f"user_profile: {e}")
-
-    # 2. Delete Firestore company document
-    if company_id:
+    # 1. Delete company document (SET NULL cascade handles users.company_id)
+    if company_id_str:
+        import uuid as _uuid
         try:
-            db.collection("companies").document(company_id).delete()
+            cid = _uuid.UUID(company_id_str)
+            db.query(Company).filter(Company.id == cid).delete()
         except Exception as e:
-            errors.append(f"company: {e}")
+            print(f"[employer] Company deletion error for {company_id_str}: {e}")
 
-    # 3. Delete Firebase Auth account
-    try:
-        fb_auth.delete_user(uid)
-    except Exception as e:
-        errors.append(f"firebase_auth: {e}")
-
-    if errors:
-        print(f"[employer] Partial deletion errors for {uid}: {errors}")
-        raise HTTPException(
-            500,
-            f"Account partially deleted. Manual cleanup may be needed: {errors}",
-        )
+    # 2. Delete user row (ON DELETE CASCADE handles refresh_tokens, sessions, check_ins)
+    db.query(User).filter(User.id == uid).delete()
+    db.commit()
 
     return MutationResponse(
         success=True,
