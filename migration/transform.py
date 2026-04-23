@@ -81,3 +81,43 @@ def transform_company(doc_id: str, doc: dict) -> dict:
         **({"created_at": known["created_at"]} if "created_at" in known else {}),
         **({"updated_at": known["updated_at"]} if "updated_at" in known else {}),
     }
+
+
+# ─── users ────────────────────────────────────────────────────────────────────
+
+_USER_COLS = {
+    "email", "password_hash", "role", "company_id", "manager_id",
+    "department", "is_active", "profile", "created_at", "updated_at",
+}
+_USER_REQUIRED = {"email"}
+_USER_DROP_DENORMALIZED = {"direct_reports"}
+
+
+def transform_user(doc_id: str, doc: dict) -> dict:
+    missing = _USER_REQUIRED - doc.keys()
+    if missing:
+        raise MissingRequiredField(f"users/{doc_id} missing: {sorted(missing)}")
+    # Drop known denormalized fields up-front so they don't hit `profile`.
+    doc = {k: v for k, v in doc.items() if k not in _USER_DROP_DENORMALIZED}
+    known, extras = split_known_and_extras(doc, _USER_COLS)
+
+    profile = dict(known.get("profile") or {})
+    profile.update(extras)
+
+    company_id = known.get("company_id")
+    if company_id is not None and not isinstance(company_id, uuid.UUID):
+        company_id = coerce_uuid(company_id)
+
+    return {
+        "id": doc_id,  # preserve Firebase UID verbatim
+        "email": known["email"],
+        "password_hash": None,  # users reset on first login post-cutover
+        "role": known.get("role") or "employee",
+        "company_id": company_id,
+        "manager_id": known.get("manager_id"),
+        "department": known.get("department"),
+        "is_active": known.get("is_active") if "is_active" in known else True,
+        "profile": profile,
+        **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
+        **({"updated_at": known["updated_at"]} if "updated_at" in known and known["updated_at"] is not None else {}),
+    }

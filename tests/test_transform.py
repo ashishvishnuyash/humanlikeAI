@@ -89,3 +89,49 @@ def test_transform_company_preserves_existing_settings():
 def test_transform_company_missing_name_raises():
     with pytest.raises(MissingRequiredField):
         transform_company("cid", {"owner_id": "u1"})  # no 'name'
+
+
+# --- users ---
+
+from migration.transform import transform_user  # noqa: E402
+
+
+def test_transform_user_preserves_firebase_uid_as_id():
+    doc = {
+        "email": "a@example.com",
+        "role": "employee",
+        "company_id": "b4d7c422-f13c-4465-84fc-70b6e922b625",
+        "manager_id": "uid-mgr-1",
+        "department": "Eng",
+        "is_active": True,
+        "display_name": "Alice",  # extra → profile
+        "direct_reports": ["u1", "u2"],  # denormalization, drop
+        "created_at": None,
+    }
+    row = transform_user("firebase-uid-abc", doc)
+    # id preserved verbatim (TEXT column)
+    assert row["id"] == "firebase-uid-abc"
+    assert row["email"] == "a@example.com"
+    assert row["role"] == "employee"
+    # company_id should be a uuid.UUID
+    assert str(row["company_id"]) == "b4d7c422-f13c-4465-84fc-70b6e922b625"
+    assert row["manager_id"] == "uid-mgr-1"
+    assert row["department"] == "Eng"
+    assert row["is_active"] is True
+    # Extras folded into profile; denormalized `direct_reports` dropped entirely
+    assert row["profile"]["display_name"] == "Alice"
+    assert "direct_reports" not in row["profile"]
+    # password_hash is None — users will reset on first login post-cutover
+    assert row["password_hash"] is None
+
+
+def test_transform_user_missing_email_raises():
+    from migration.transform import MissingRequiredField
+    with pytest.raises(MissingRequiredField):
+        transform_user("uid", {"role": "employee"})
+
+
+def test_transform_user_missing_role_defaults_to_employee():
+    # Role is required logically but some legacy docs omit it. Default to employee.
+    row = transform_user("uid", {"email": "x@y.com"})
+    assert row["role"] == "employee"
