@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import csv
 import io
-import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -665,27 +664,23 @@ async def _upload_results_csv(job_id: str, company_id: str) -> Optional[str]:
     writer.writerows(results)
     csv_bytes = buf.getvalue().encode("utf-8")
 
-    # Upload to Firebase Storage
-    # TODO: Phase 5 - Azure Blob (replace Firebase Storage with Azure Blob Storage)
-    bucket_name = os.environ.get("FIREBASE_STORAGE_BUCKET")
-    if not bucket_name:
-        print("[import_job] FIREBASE_STORAGE_BUCKET not set — skipping results CSV upload")
-        return None
-
+    # Upload to Azure Blob Storage
     try:
-        from firebase_admin import storage  # TODO: Phase 5 - Azure Blob
-        import datetime as dt
-
-        bucket = storage.bucket(bucket_name)  # TODO: Phase 5 - Azure Blob
-        blob   = bucket.blob(f"import_results/{company_id}/{job_id}.csv")  # TODO: Phase 5 - Azure Blob
-        blob.upload_from_string(csv_bytes, content_type="text/csv")  # TODO: Phase 5 - Azure Blob
-
-        # Signed URL valid for 7 days
-        url = blob.generate_signed_url(  # TODO: Phase 5 - Azure Blob
-            expiration=dt.timedelta(days=7),
-            method="GET",
+        from storage.blob import (
+            EMPLOYEE_IMPORTS_CONTAINER,
+            generate_signed_get_url,
+            upload_bytes,
         )
-        return url
+
+        key = f"{company_id}/{job_id}.csv"
+        blob_url = upload_bytes(
+            container=EMPLOYEE_IMPORTS_CONTAINER,
+            key=key,
+            data=csv_bytes,
+            content_type="text/csv",
+        )
+        # Signed URL valid for 7 days (604800 seconds).
+        return generate_signed_get_url(blob_url, expires_seconds=7 * 24 * 3600)
     except Exception as e:
         print(f"[import_job] Firebase Storage upload error: {e}")
         return None
