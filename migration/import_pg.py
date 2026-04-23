@@ -37,9 +37,11 @@ def _prepare_row(row: dict) -> dict:
 
 
 # Azure Postgres can drop connections on very large single-statement inserts
-# (the total SQL text gets too big, or exceeds server limits). Batching at
-# 100 rows per INSERT keeps round trips short and stays well within limits.
-_BATCH_SIZE = 100
+# (the total SQL text gets too big, or exceeds server limits). Batch size is
+# read from ETL_BATCH_SIZE env var (default 100) so large-JSONB collections
+# like chat_sessions can use smaller batches.
+import os as _os
+_BATCH_SIZE = int(_os.environ.get("ETL_BATCH_SIZE", "100"))
 
 
 def insert_rows(

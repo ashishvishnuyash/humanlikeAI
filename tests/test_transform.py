@@ -386,8 +386,10 @@ def test_transform_call_session():
     })
     assert row["call_id"] == call_uuid
     assert row["status"] == "active"
-    # both `metadata` and extras merged into call_metadata (DB column `metadata`)
-    assert row["call_metadata"] == {"codec": "opus", "stream_sid": "abc"}
+    # both `metadata` and extras merged into the DB column named "metadata"
+    # (the ORM Python attribute is call_metadata, but Core inserts use the
+    # column name)
+    assert row["metadata"] == {"codec": "opus", "stream_sid": "abc"}
 
 
 def test_transform_import_job_uses_stats_catchall():

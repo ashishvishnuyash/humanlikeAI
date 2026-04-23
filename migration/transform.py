@@ -76,6 +76,36 @@ def apply_aliases(doc: dict, aliases: dict) -> dict:
     return result
 
 
+def jsonable(value):
+    """Recursively coerce a value so it can be stored in a JSONB column.
+
+    Firestore's ``DatetimeWithNanoseconds`` (and plain ``datetime``) isn't
+    natively JSON-serializable via psycopg2's adapter — convert to ISO strings.
+    ``NaN`` / ``Infinity`` floats are invalid JSON per RFC 8259 and Postgres
+    rejects them — coerce to ``None``. ``GeoPoint`` and unknown custom types
+    become their ``repr()``.
+    """
+    from datetime import date, datetime
+    import math
+
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(v) for v in value]
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    # Fallback: repr so we don't silently drop the value.
+    return repr(value)
+
+
 def _warn_dropped(table: str, doc_id: str, extras: dict) -> None:
     if extras:
         print(
@@ -191,9 +221,11 @@ def transform_mh_session(doc_id: str, doc: dict) -> dict:
 # ─── mental_health_reports ────────────────────────────────────────────────────
 
 _MHR_COLS = {"user_id", "company_id", "report", "risk_level", "generated_at"}
+_MHR_ALIASES = {"employee_id": "user_id", "created_at": "generated_at"}
 
 
 def transform_mental_health_report(doc_id: str, doc: dict) -> dict:
+    doc = apply_aliases(doc, _MHR_ALIASES)
     known, extras = split_known_and_extras(doc, _MHR_COLS)
     report = dict(known.get("report") or {})
     report.update(extras)
@@ -234,9 +266,11 @@ def transform_chat_session(doc_id: str, doc: dict) -> dict:
 # ─── ai_recommendations ───────────────────────────────────────────────────────
 
 _AIR_COLS = {"user_id", "company_id", "recommendation", "category", "created_at"}
+_AIR_ALIASES = {"employee_id": "user_id"}
 
 
 def transform_ai_recommendation(doc_id: str, doc: dict) -> dict:
+    doc = apply_aliases(doc, _AIR_ALIASES)
     known, extras = split_known_and_extras(doc, _AIR_COLS)
     rec = dict(known.get("recommendation") or {})
     rec.update(extras)
@@ -410,7 +444,11 @@ _CP_COLS = {
     "company_id", "anonymous_profile_id", "content", "likes", "replies",
     "is_approved", "extras", "created_at",
 }
-_CP_ALIASES = {"author_id": "anonymous_profile_id"}
+# Note: Firestore community posts use `author_id` = Firebase UID of the real
+# user. Our schema uses `anonymous_profile_id` (UUID FK to anonymous_profiles).
+# We preserve author_id in `extras.author_id`; a post-ETL linking step can
+# resolve it to the anonymous_profile_id via users.id → anonymous_profiles.user_id.
+_CP_ALIASES = {}
 
 
 def transform_community_post(doc_id: str, doc: dict) -> dict:
@@ -436,7 +474,8 @@ def transform_community_post(doc_id: str, doc: dict) -> dict:
 # ─── community_replies ────────────────────────────────────────────────────────
 
 _CR_COLS = {"post_id", "anonymous_profile_id", "content", "is_approved", "extras", "created_at"}
-_CR_ALIASES = {"author_id": "anonymous_profile_id"}
+# Same as community_posts — `author_id` is a Firebase UID, preserved in extras.
+_CR_ALIASES = {}
 
 
 def transform_community_reply(doc_id: str, doc: dict) -> dict:
@@ -570,12 +609,18 @@ def transform_call_session(doc_id: str, doc: dict) -> dict:
     known, extras = split_known_and_extras(doc, _CALLSESS_COLS)
     call_meta = dict(known.get("metadata") or {})
     call_meta.update(extras)
-    call_id = known.get("call_id")
+    # Firestore's callSessions docs use the parent call's ID as their own
+    # doc_id (no separate call_id field). Fall back to doc_id → UUIDv5,
+    # which matches how `transform_call` coerces the same source string.
+    call_id_src = known.get("call_id") or doc_id
+    # NOTE: the DB column is named "metadata" even though the Python attribute
+    # on the ORM model is "call_metadata" (SQLAlchemy reserves the attr name
+    # `metadata`). For Core inserts we use the column name.
     return {
         "id": coerce_uuid(doc_id),
-        "call_id": coerce_uuid(call_id) if call_id else None,
+        "call_id": coerce_uuid(call_id_src),
         "status": known.get("status"),
-        "call_metadata": call_meta,
+        "metadata": call_meta,
         **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
         **({"updated_at": known["updated_at"]} if "updated_at" in known and known["updated_at"] is not None else {}),
     }
