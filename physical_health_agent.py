@@ -9,12 +9,18 @@ Called by routers/physical_health.py — never called directly by main.py.
 """
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from langchain_openai import ChatOpenAI
-from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 
+from db.session import get_session_factory
+from db.models.physical_health import (
+    MedicalDocument,
+    PhysicalHealthCheckin,
+    PhysicalHealthReport,
+    WellnessEvent,
+)
 from physical_health_schemas import (
     MedicalReportAnalysis,
     PeriodicReportResponse,
@@ -27,6 +33,10 @@ from physical_health_prompts import (
 )
 from report_schemas import score_to_level
 from rag import get_rag_store
+
+# ─── Session factory (agent runs outside FastAPI request cycle) ───────────────
+
+SessionLocal = get_session_factory()
 
 
 # ─── LLM singleton ───────────────────────────────────────────────────────────
@@ -119,34 +129,32 @@ async def process_medical_document(
     company_id:  str,
     raw_text:    str,
     report_type: str,
-    db,
 ) -> None:
     """
     Background task triggered after a medical file is uploaded.
 
     Steps:
-    1. Set status → "processing"
-    2. Analyse with LLM → MedicalReportAnalysis
-    3. Ingest text chunks into RAG with medical metadata
-    4. Fetch recent check-in context for suggestions
-    5. Generate personalised suggestions
-    6. Update Firestore doc with results + status → "analyzed"
-    7. If urgency_level == "emergency" → write wellness_event for in-app alert
+    1. Analyse with LLM → MedicalReportAnalysis
+    2. Ingest text chunks into RAG with medical metadata
+    3. Fetch recent check-in context for suggestions
+    4. Generate personalised suggestions
+    5. Update MedicalDocument extracted_text if empty (text already set at upload)
+    6. If urgency_level == "emergency" → write wellness_event for in-app alert
+
+    NOTE: Analysis metadata fields (status, summary, key_findings, etc.) are not
+    persisted in the current MedicalDocument schema. Phase 5 will add a metadata
+    JSONB column for full persistence.
     """
-    doc_ref = db.collection("medical_documents").document(doc_id)
-
     try:
-        # Step 1 — mark as processing
-        doc_ref.update({"status": "processing"})
-
-        # Step 2 — LLM analysis
+        # Step 1 — LLM analysis
         analysis = analyze_medical_document(raw_text)
 
-        # Step 3 — RAG ingestion (filtered by user_id so Q&A stays private)
-        chunk_ids: List[str] = []
+        # Step 2 — RAG ingestion (filtered by user_id so Q&A stays private)
+        # chunk_ids will be persisted in Phase 5 (rag_chunk_ids column on MedicalDocument)
+        chunk_ids: List[str] = []  # noqa: F841
         try:
             store = get_rag_store()
-            chunk_ids = store.add_documents(
+            chunk_ids = store.add_documents(  # noqa: F841
                 texts=[raw_text],
                 metadata_per_doc=[{
                     "type":        "medical_report",
@@ -161,53 +169,57 @@ async def process_medical_document(
             print(f"[physical_health_agent] RAG ingestion error for {doc_id}: {rag_err}")
             # Non-fatal — analysis still saved without RAG
 
-        # Step 4 — fetch recent check-in context for suggestions
-        checkin_context = _build_checkin_context(user_id, db)
+        # Step 3 — fetch recent check-in context for suggestions
+        checkin_context = _build_checkin_context(user_id)
 
-        # Step 5 — personalised suggestions
-        suggestions = generate_health_suggestions(analysis, checkin_context)
+        # Step 4 — personalised suggestions
+        # suggestions will be persisted in Phase 5 (metadata JSONB column on MedicalDocument)
+        suggestions = generate_health_suggestions(analysis, checkin_context)  # noqa: F841
 
-        # Step 6 — update Firestore with all results
-        doc_ref.update({
-            "status":           "analyzed",
-            "analyzed_at":      SERVER_TIMESTAMP,
-            "rag_chunk_ids":    chunk_ids,
-            "summary":          analysis.summary,
-            "key_findings":     analysis.key_findings,
-            "flagged_values":   [fv.model_dump() for fv in analysis.flagged_values],
-            "recommendations":  suggestions or analysis.recommendations,
-            "follow_up_needed": analysis.follow_up_needed,
-            "urgency_level":    analysis.urgency_level,
-            "report_type":      analysis.report_type,
-            "report_date":      analysis.report_date,
-        })
+        # Step 5 — update extracted_text if it was empty at upload time
+        # (Phase 5 will persist full analysis metadata via a JSONB column)
+        try:
+            with SessionLocal() as db:
+                doc = (
+                    db.query(MedicalDocument)
+                    .filter(MedicalDocument.id == uuid.UUID(doc_id))
+                    .one_or_none()
+                )
+                if doc is not None and not doc.extracted_text:
+                    db.query(MedicalDocument).filter(
+                        MedicalDocument.id == uuid.UUID(doc_id)
+                    ).update({"extracted_text": raw_text})
+                    db.commit()
+        except Exception as e:
+            print(f"[physical_health_agent] MedicalDocument update error for {doc_id}: {e}")
 
-        # Step 7 — emergency escalation (user-only alert, never visible to employer)
+        # Step 6 — emergency escalation (user-only alert, never visible to employer)
         if analysis.urgency_level == "emergency":
             try:
-                db.collection("wellness_events").add({
-                    "user_id":    user_id,
-                    "company_id": company_id,
-                    "event_type": "medical_emergency_flag",
-                    "source":     "medical_document",
-                    "doc_id":     doc_id,
-                    "message":    (
-                        "Your recently uploaded health document contains findings "
-                        "that may require immediate medical attention. "
-                        "Please contact a healthcare professional as soon as possible."
-                    ),
-                    "created_at": SERVER_TIMESTAMP,
-                    "seen":       False,
-                })
+                cid: Optional[uuid.UUID] = uuid.UUID(company_id) if company_id else None
+                with SessionLocal() as db:
+                    db.add(WellnessEvent(
+                        id=uuid.uuid4(),
+                        user_id=user_id,
+                        company_id=cid,
+                        event_type="medical_emergency_flag",
+                        data={
+                            "source":  "medical_document",
+                            "doc_id":  doc_id,
+                            "message": (
+                                "Your recently uploaded health document contains findings "
+                                "that may require immediate medical attention. "
+                                "Please contact a healthcare professional as soon as possible."
+                            ),
+                            "seen": False,
+                        },
+                    ))
+                    db.commit()
             except Exception as e:
                 print(f"[physical_health_agent] wellness_event write error: {e}")
 
     except Exception as e:
         print(f"[physical_health_agent] process_medical_document failed for {doc_id}: {e}")
-        try:
-            doc_ref.update({"status": "failed"})
-        except Exception:
-            pass
 
 
 # ─── Periodic report generation ──────────────────────────────────────────────
@@ -220,12 +232,11 @@ def generate_periodic_report(
     period_start: datetime,
     period_end:   datetime,
     report_type:  str,
-    db,
 ) -> PeriodicReportResponse:
     """
     Synthesise a period health report from aggregated check-in data
     + any relevant medical context retrieved from RAG.
-    Saves result to physical_health_reports collection.
+    Saves result to physical_health_reports table.
     """
 
     # Build metrics summary string for the prompt
@@ -270,42 +281,51 @@ def generate_periodic_report(
         "medical_context": medical_context,
     })
 
-    report_id = str(uuid.uuid4())
+    report_id = uuid.uuid4()
     generated_at = datetime.now(timezone.utc)
+    cid: Optional[uuid.UUID] = uuid.UUID(company_id) if company_id else None
 
-    # Persist to Firestore
+    # Persist to physical_health_reports
+    report_payload = {
+        "report_id":                    str(report_id),
+        "user_id":                      user_id,
+        "company_id":                   str(cid) if cid else None,
+        "period_start":                 period_start.isoformat(),
+        "period_end":                   period_end.isoformat(),
+        "report_type":                  report_type,
+        "avg_energy":                   aggregates.get("avg_energy", 0),
+        "avg_sleep_quality":            aggregates.get("avg_sleep_quality", 0),
+        "avg_sleep_hours":              aggregates.get("avg_sleep_hours", 0),
+        "avg_exercise_minutes_per_day": aggregates.get("avg_exercise_minutes_daily", 0),
+        "avg_nutrition_quality":        aggregates.get("avg_nutrition_quality", 0),
+        "avg_pain_level":               aggregates.get("avg_pain_level", 0),
+        "avg_hydration":                aggregates.get("avg_hydration", 0),
+        "exercise_days_count":          aggregates.get("exercise_days", 0),
+        "overall_score":                llm_result.overall_score,
+        "overall_level":                score_to_level(llm_result.overall_score),
+        "trend":                        llm_result.trend,
+        "summary":                      llm_result.summary,
+        "strengths":                    llm_result.strengths,
+        "concerns":                     llm_result.concerns,
+        "recommendations":              llm_result.recommendations,
+        "risk_flags":                   llm_result.risk_flags,
+        "follow_up_suggested":          llm_result.follow_up_suggested,
+    }
+
     try:
-        db.collection("physical_health_reports").document(report_id).set({
-            "report_id":                  report_id,
-            "user_id":                    user_id,
-            "company_id":                 company_id,
-            "generated_at":               SERVER_TIMESTAMP,
-            "period_start":               period_start.isoformat(),
-            "period_end":                 period_end.isoformat(),
-            "report_type":                report_type,
-            "avg_energy":                 aggregates.get("avg_energy", 0),
-            "avg_sleep_quality":          aggregates.get("avg_sleep_quality", 0),
-            "avg_sleep_hours":            aggregates.get("avg_sleep_hours", 0),
-            "avg_exercise_minutes_per_day": aggregates.get("avg_exercise_minutes_daily", 0),
-            "avg_nutrition_quality":      aggregates.get("avg_nutrition_quality", 0),
-            "avg_pain_level":             aggregates.get("avg_pain_level", 0),
-            "avg_hydration":              aggregates.get("avg_hydration", 0),
-            "exercise_days_count":        aggregates.get("exercise_days", 0),
-            "overall_score":              llm_result.overall_score,
-            "overall_level":              score_to_level(llm_result.overall_score),
-            "trend":                      llm_result.trend,
-            "summary":                    llm_result.summary,
-            "strengths":                  llm_result.strengths,
-            "concerns":                   llm_result.concerns,
-            "recommendations":            llm_result.recommendations,
-            "risk_flags":                 llm_result.risk_flags,
-            "follow_up_suggested":        llm_result.follow_up_suggested,
-        })
+        with SessionLocal() as db:
+            db.add(PhysicalHealthReport(
+                id=report_id,
+                user_id=user_id,
+                company_id=cid,
+                report=report_payload,
+            ))
+            db.commit()
     except Exception as e:
-        print(f"[physical_health_agent] Firestore write error for periodic report: {e}")
+        print(f"[physical_health_agent] DB write error for periodic report: {e}")
 
     return PeriodicReportResponse(
-        report_id=report_id,
+        report_id=str(report_id),
         period_start=period_start.isoformat(),
         period_end=period_end.isoformat(),
         report_type=report_type,
@@ -330,35 +350,39 @@ def generate_periodic_report(
 
 # ─── Internal helpers ─────────────────────────────────────────────────────────
 
-def _build_checkin_context(user_id: str, db) -> str:
+def _build_checkin_context(user_id: str) -> str:
     """
     Build a short text summary of the user's last 7 days of check-ins
     for use in the suggestions prompt. Returns empty string on failure.
     """
     try:
-        from datetime import timedelta
         cutoff = datetime.now(timezone.utc) - timedelta(days=7)
-        docs = (
-            db.collection("physical_health_checkins")
-            .where("user_id", "==", user_id)
-            .where("created_at", ">=", cutoff)
-            .stream()
-        )
+
+        with SessionLocal() as db:
+            rows = (
+                db.query(PhysicalHealthCheckin)
+                .filter(
+                    PhysicalHealthCheckin.user_id == user_id,
+                    PhysicalHealthCheckin.created_at >= cutoff,
+                )
+                .order_by(PhysicalHealthCheckin.created_at.desc())
+                .all()
+            )
 
         totals = {
             "energy": [], "sleep_quality": [], "sleep_hours": [],
             "nutrition": [], "pain": [], "hydration": [], "exercise_min": [],
         }
 
-        for doc in docs:
-            d = doc.to_dict()
-            totals["energy"].append(d.get("energy_level", 0))
-            totals["sleep_quality"].append(d.get("sleep_quality", 0))
-            totals["sleep_hours"].append(d.get("sleep_hours", 0))
-            totals["nutrition"].append(d.get("nutrition_quality", 0))
-            totals["pain"].append(d.get("pain_level", 0))
-            totals["hydration"].append(d.get("hydration", 0))
-            totals["exercise_min"].append(d.get("exercise_minutes", 0))
+        for row in rows:
+            v = row.vitals or {}
+            totals["energy"].append(v.get("energy_level", 0))
+            totals["sleep_quality"].append(v.get("sleep_quality", 0))
+            totals["sleep_hours"].append(v.get("sleep_hours", 0))
+            totals["nutrition"].append(v.get("nutrition_quality", 0))
+            totals["pain"].append(v.get("pain_level", 0))
+            totals["hydration"].append(v.get("hydration", 0))
+            totals["exercise_min"].append(v.get("exercise_minutes", 0))
 
         if not totals["energy"]:
             return "No recent check-in data available."
