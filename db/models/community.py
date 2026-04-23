@@ -27,6 +27,9 @@ class AnonymousProfile(Base):
     )
     handle: Mapped[str] = mapped_column(String, nullable=False, unique=True)
     avatar: Mapped[str | None] = mapped_column(String, nullable=True)
+    extras: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
     created_at: Mapped[datetime] = mapped_column(
         nullable=False, server_default=func.now()
     )
@@ -58,6 +61,9 @@ class CommunityPost(Base):
     is_approved: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="true"
     )
+    extras: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
     created_at: Mapped[datetime] = mapped_column(
         nullable=False, server_default=func.now()
     )
@@ -88,6 +94,9 @@ class CommunityReply(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     is_approved: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="true"
+    )
+    extras: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
     )
     created_at: Mapped[datetime] = mapped_column(
         nullable=False, server_default=func.now()
@@ -131,6 +140,9 @@ class UserGamification(Base):
     )
     streak: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default="0"
+    )
+    extras: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
     )
     updated_at: Mapped[datetime] = mapped_column(
         nullable=False, server_default=func.now(), onupdate=func.now()

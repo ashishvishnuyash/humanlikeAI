@@ -107,6 +107,9 @@ class ChatSession(Base):
     messages: Mapped[dict] = mapped_column(
         JSONB, nullable=False, server_default="[]"
     )
+    extras: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
     created_at: Mapped[datetime] = mapped_column(
         nullable=False, server_default=func.now()
     )
