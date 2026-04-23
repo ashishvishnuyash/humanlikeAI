@@ -431,20 +431,21 @@ async def upload_medical_report(
     except Exception as e:
         raise HTTPException(500, f"Failed to extract text from file: {e}")
 
-    # Upload to Firebase Storage  # TODO: Phase 5 - Azure Blob
-    storage_path = f"medical_reports/{uid}/{doc_id_str}/{filename}"
+    # Upload to Azure Blob Storage
+    storage_key = f"{uid}/{doc_id_str}/{filename}"
     blob_url = ""
     try:
-        from firebase_config import firebaseConfig
-        import firebase_admin.storage as fb_storage  # TODO: Phase 5 - Azure Blob
-        bucket = fb_storage.bucket(firebaseConfig["storageBucket"])  # TODO: Phase 5 - Azure Blob
-        blob = bucket.blob(storage_path)  # TODO: Phase 5 - Azure Blob
-        blob.upload_from_string(file_bytes, content_type=file.content_type or "application/octet-stream")  # TODO: Phase 5 - Azure Blob
-        blob_url = blob.public_url or storage_path
+        from storage.blob import MEDICAL_DOCUMENTS_CONTAINER, upload_bytes
+        blob_url = upload_bytes(
+            container=MEDICAL_DOCUMENTS_CONTAINER,
+            key=storage_key,
+            data=file_bytes,
+            content_type=file.content_type or "application/octet-stream",
+        )
     except Exception as e:
-        # Non-fatal: store the doc and process even if Storage upload fails
-        print(f"[physical_health] Firebase Storage upload error for {doc_id_str}: {e}")
-        blob_url = storage_path  # fallback: store path as blob_url
+        # Non-fatal: store the doc and process even if Blob upload fails
+        print(f"[physical_health] Azure Blob upload error for {doc_id_str}: {e}")
+        blob_url = storage_key  # fallback: store path as blob_url
 
     # Create SQLAlchemy MedicalDocument record
     # NOTE: analysis metadata (status, report_type, rag_chunk_ids, etc.) is stored
@@ -605,15 +606,12 @@ async def delete_medical_document(
 
     errors: List[str] = []
 
-    # 1. Delete from Firebase Storage  # TODO: Phase 5 - Azure Blob
+    # 1. Delete from Azure Blob Storage
     blob_url = row.blob_url or ""
-    if blob_url:
+    if blob_url.startswith("https://"):
         try:
-            from firebase_config import firebaseConfig
-            import firebase_admin.storage as fb_storage  # TODO: Phase 5 - Azure Blob
-            bucket = fb_storage.bucket(firebaseConfig["storageBucket"])  # TODO: Phase 5 - Azure Blob
-            blob = bucket.blob(blob_url)  # TODO: Phase 5 - Azure Blob
-            blob.delete()  # TODO: Phase 5 - Azure Blob
+            from storage.blob import delete_by_url
+            delete_by_url(blob_url)
         except Exception as e:
             errors.append(f"storage: {e}")
 
