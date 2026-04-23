@@ -135,3 +135,271 @@ def test_transform_user_missing_role_defaults_to_employee():
     # Role is required logically but some legacy docs omit it. Default to employee.
     row = transform_user("uid", {"email": "x@y.com"})
     assert row["role"] == "employee"
+
+
+# --- tests for remaining 20 transformers ---
+
+from migration.transform import (  # noqa: E402
+    transform_ai_recommendation,
+    transform_anonymous_profile,
+    transform_call,
+    transform_call_session,
+    transform_chat_session,
+    transform_check_in,
+    transform_community_post,
+    transform_community_reply,
+    transform_escalation_ticket,
+    transform_import_job,
+    transform_intervention,
+    transform_medical_document,
+    transform_mental_health_report,
+    transform_mh_session,
+    transform_physical_health_checkin,
+    transform_physical_health_report,
+    transform_user_gamification,
+    transform_wellness_challenge,
+    transform_wellness_event,
+)
+
+
+def _uuid_str():
+    return str(uuid.uuid4())
+
+
+def test_transform_check_in_uses_data_catchall():
+    row = transform_check_in("cid-1", {
+        "user_id": "u1",
+        "company_id": _uuid_str(),
+        "mood_score": 7,  # extra → data JSONB
+        "stress_level": 4,  # extra → data JSONB
+        "notes": "ok",  # extra → data
+        "created_at": datetime(2024, 3, 1, tzinfo=timezone.utc),
+    })
+    assert row["user_id"] == "u1"
+    assert row["data"]["mood_score"] == 7
+    assert row["data"]["stress_level"] == 4
+    assert row["data"]["notes"] == "ok"
+
+
+def test_transform_mh_session_preserves_messages():
+    row = transform_mh_session("s1", {
+        "user_id": "u1",
+        "company_id": _uuid_str(),
+        "messages": [{"role": "user", "content": "hi"}],
+        "summary": "friendly chat",
+    })
+    assert row["messages"] == [{"role": "user", "content": "hi"}]
+    assert row["summary"] == "friendly chat"
+
+
+def test_transform_mental_health_report_uses_report_catchall():
+    row = transform_mental_health_report("r1", {
+        "user_id": "u1",
+        "company_id": _uuid_str(),
+        "risk_level": "low",
+        "summary": "all good",  # extra → report
+        "generated_at": datetime(2024, 3, 1, tzinfo=timezone.utc),
+    })
+    assert row["risk_level"] == "low"
+    assert row["report"]["summary"] == "all good"
+
+
+def test_transform_chat_session_message_list():
+    row = transform_chat_session("cs1", {
+        "user_id": "u1",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert row["user_id"] == "u1"
+    assert row["messages"] == [{"role": "user", "content": "hi"}]
+
+
+def test_transform_ai_recommendation_uses_recommendation_catchall():
+    row = transform_ai_recommendation("r1", {
+        "user_id": "u1",
+        "category": "sleep",
+        "title": "Go to bed earlier",  # extra → recommendation
+        "body": "Try 10pm.",  # extra → recommendation
+    })
+    assert row["category"] == "sleep"
+    assert row["recommendation"]["title"] == "Go to bed earlier"
+    assert row["recommendation"]["body"] == "Try 10pm."
+
+
+def test_transform_intervention():
+    row = transform_intervention("iv1", {
+        "user_id": "u1",
+        "company_id": _uuid_str(),
+        "status": "pending",
+        "kind": "hr_followup",  # extra → data
+    })
+    assert row["status"] == "pending"
+    assert row["data"]["kind"] == "hr_followup"
+
+
+def test_transform_escalation_ticket():
+    row = transform_escalation_ticket("t1", {
+        "user_id": "u1",
+        "company_id": _uuid_str(),
+        "assigned_to": "hr-uid",
+        "status": "open",
+        "priority": "high",
+        "subject": "anxiety",  # extra → data
+    })
+    assert row["assigned_to"] == "hr-uid"
+    assert row["priority"] == "high"
+    assert row["data"]["subject"] == "anxiety"
+
+
+def test_transform_physical_health_checkin_vitals_catchall():
+    row = transform_physical_health_checkin("p1", {
+        "user_id": "u1",
+        "company_id": _uuid_str(),
+        "vitals": {"hr": 72},
+        "symptoms": {"headache": False},
+        "weight_kg": 70,  # extra → vitals
+    })
+    assert row["vitals"] == {"hr": 72, "weight_kg": 70}
+    assert row["symptoms"] == {"headache": False}
+
+
+def test_transform_physical_health_report_catchall():
+    row = transform_physical_health_report("ph1", {
+        "user_id": "u1",
+        "company_id": _uuid_str(),
+        "summary": "good",  # extra → report
+    })
+    assert row["report"]["summary"] == "good"
+
+
+def test_transform_medical_document():
+    row = transform_medical_document("md1", {
+        "user_id": "u1",
+        "filename": "lab.pdf",
+        "blob_url": "https://firebasestorage.googleapis.com/v0/b/x/medical_reports/u1/md1/lab.pdf",
+        "mime_type": "application/pdf",
+        "size_bytes": 1024,
+        "extracted_text": "text",
+        "random": "dropped",  # no catch-all; should be logged+dropped
+    })
+    assert row["filename"] == "lab.pdf"
+    assert row["blob_url"].startswith("https://firebasestorage")
+    assert row["size_bytes"] == 1024
+    # 'random' should NOT appear in row
+    assert "random" not in row
+
+
+def test_transform_wellness_event():
+    row = transform_wellness_event("w1", {
+        "user_id": "u1",
+        "company_id": _uuid_str(),
+        "event_type": "streak",
+        "detail": "7 days",  # extra → data
+    })
+    assert row["event_type"] == "streak"
+    assert row["data"]["detail"] == "7 days"
+
+
+def test_transform_anonymous_profile():
+    row = transform_anonymous_profile("ap1", {
+        "user_id": "u1",
+        "handle": "cool_axolotl",
+        "avatar": "🐸",
+    })
+    assert row["user_id"] == "u1"
+    assert row["handle"] == "cool_axolotl"
+
+
+def test_transform_community_post():
+    row = transform_community_post("cp1", {
+        "company_id": _uuid_str(),
+        "anonymous_profile_id": _uuid_str(),
+        "content": "hi everyone",
+        "likes": 3,
+        "replies": 1,
+        "is_approved": True,
+    })
+    assert row["content"] == "hi everyone"
+    assert row["likes"] == 3
+    assert row["replies"] == 1
+    assert row["is_approved"] is True
+
+
+def test_transform_community_reply():
+    row = transform_community_reply("cr1", {
+        "post_id": _uuid_str(),
+        "anonymous_profile_id": _uuid_str(),
+        "content": "me too",
+        "is_approved": True,
+    })
+    assert row["content"] == "me too"
+
+
+def test_transform_user_gamification():
+    row = transform_user_gamification("ug1", {
+        "user_id": "u1",
+        "company_id": _uuid_str(),
+        "points": 100,
+        "level": 3,
+        "badges": ["streak-7", "first-checkin"],
+        "streak": 7,
+    })
+    assert row["points"] == 100
+    assert row["level"] == 3
+    assert row["badges"] == ["streak-7", "first-checkin"]
+
+
+def test_transform_wellness_challenge():
+    row = transform_wellness_challenge("wc1", {
+        "company_id": _uuid_str(),
+        "title": "30 days of water",
+        "description": "Drink 2L/day",
+        "is_active": True,
+        "reward_points": 500,  # extra → data
+    })
+    assert row["title"] == "30 days of water"
+    assert row["is_active"] is True
+    assert row["data"]["reward_points"] == 500
+
+
+def test_transform_call():
+    row = transform_call("call-1", {
+        "caller_id": "u1",
+        "callee_id": "u2",
+        "status": "ended",
+        "end_reason": "hangup",
+    })
+    assert row["caller_id"] == "u1"
+    assert row["callee_id"] == "u2"
+    assert row["end_reason"] == "hangup"
+
+
+def test_transform_call_session():
+    call_uuid = uuid.uuid4()
+    row = transform_call_session("cs-1", {
+        "call_id": str(call_uuid),
+        "status": "active",
+        "metadata": {"codec": "opus"},
+        "stream_sid": "abc",  # extra → call_metadata
+    })
+    assert row["call_id"] == call_uuid
+    assert row["status"] == "active"
+    # both `metadata` and extras merged into call_metadata (DB column `metadata`)
+    assert row["call_metadata"] == {"codec": "opus", "stream_sid": "abc"}
+
+
+def test_transform_import_job_uses_stats_catchall():
+    company_uuid = uuid.uuid4()
+    row = transform_import_job("ij1", {
+        "company_id": str(company_uuid),
+        "created_by": "hr-uid",
+        "status": "completed",
+        "stats": {"total": 10, "succeeded": 9},
+        "errors": [{"row": 5, "error": "bad email"}],
+        "blob_url": "https://storage.example.com/x.csv",
+        "filename": "roster.csv",  # extra → stats
+    })
+    assert row["company_id"] == company_uuid
+    assert row["status"] == "completed"
+    assert row["stats"]["total"] == 10
+    assert row["stats"]["filename"] == "roster.csv"
+    assert row["errors"] == [{"row": 5, "error": "bad email"}]

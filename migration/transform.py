@@ -121,3 +121,410 @@ def transform_user(doc_id: str, doc: dict) -> dict:
         **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
         **({"updated_at": known["updated_at"]} if "updated_at" in known and known["updated_at"] is not None else {}),
     }
+
+
+# ─── check_ins ────────────────────────────────────────────────────────────────
+
+_CHECKIN_COLS = {"user_id", "company_id", "data", "created_at"}
+
+
+def transform_check_in(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _CHECKIN_COLS)
+    data = dict(known.get("data") or {})
+    data.update(extras)
+    cid = known.get("company_id")
+    return {
+        "id": coerce_uuid(doc_id),
+        "user_id": known.get("user_id"),
+        "company_id": coerce_uuid(cid) if cid else None,
+        "data": data,
+        **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
+    }
+
+
+# ─── sessions (mental-health chat sessions) ───────────────────────────────────
+
+_MH_SESSION_COLS = {"user_id", "company_id", "messages", "summary", "created_at", "ended_at"}
+
+
+def transform_mh_session(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _MH_SESSION_COLS)
+    _warn_dropped("sessions", doc_id, extras)
+    cid = known.get("company_id")
+    return {
+        "id": coerce_uuid(doc_id),
+        "user_id": known.get("user_id"),
+        "company_id": coerce_uuid(cid) if cid else None,
+        "messages": known.get("messages") or [],
+        "summary": known.get("summary"),
+        **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
+        **({"ended_at": known["ended_at"]} if "ended_at" in known and known["ended_at"] is not None else {}),
+    }
+
+
+# ─── mental_health_reports ────────────────────────────────────────────────────
+
+_MHR_COLS = {"user_id", "company_id", "report", "risk_level", "generated_at"}
+
+
+def transform_mental_health_report(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _MHR_COLS)
+    report = dict(known.get("report") or {})
+    report.update(extras)
+    cid = known.get("company_id")
+    return {
+        "id": coerce_uuid(doc_id),
+        "user_id": known.get("user_id"),
+        "company_id": coerce_uuid(cid) if cid else None,
+        "report": report,
+        "risk_level": known.get("risk_level"),
+        **({"generated_at": known["generated_at"]} if "generated_at" in known and known["generated_at"] is not None else {}),
+    }
+
+
+# ─── chat_sessions ────────────────────────────────────────────────────────────
+
+_CS_COLS = {"user_id", "messages", "created_at", "updated_at"}
+
+
+def transform_chat_session(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _CS_COLS)
+    _warn_dropped("chat_sessions", doc_id, extras)
+    return {
+        "id": coerce_uuid(doc_id),
+        "user_id": known.get("user_id"),
+        "messages": known.get("messages") or [],
+        **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
+        **({"updated_at": known["updated_at"]} if "updated_at" in known and known["updated_at"] is not None else {}),
+    }
+
+
+# ─── ai_recommendations ───────────────────────────────────────────────────────
+
+_AIR_COLS = {"user_id", "company_id", "recommendation", "category", "created_at"}
+
+
+def transform_ai_recommendation(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _AIR_COLS)
+    rec = dict(known.get("recommendation") or {})
+    rec.update(extras)
+    cid = known.get("company_id")
+    return {
+        "id": coerce_uuid(doc_id),
+        "user_id": known.get("user_id"),
+        "company_id": coerce_uuid(cid) if cid else None,
+        "recommendation": rec,
+        "category": known.get("category"),
+        **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
+    }
+
+
+# ─── interventions ────────────────────────────────────────────────────────────
+
+_INT_COLS = {"company_id", "user_id", "data", "status", "created_at"}
+
+
+def transform_intervention(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _INT_COLS)
+    data = dict(known.get("data") or {})
+    data.update(extras)
+    cid = known.get("company_id")
+    return {
+        "id": coerce_uuid(doc_id),
+        "company_id": coerce_uuid(cid) if cid else None,
+        "user_id": known.get("user_id"),
+        "data": data,
+        "status": known.get("status"),
+        **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
+    }
+
+
+# ─── escalation_tickets ───────────────────────────────────────────────────────
+
+_ESC_COLS = {
+    "company_id", "user_id", "assigned_to", "status", "priority",
+    "data", "created_at", "updated_at",
+}
+
+
+def transform_escalation_ticket(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _ESC_COLS)
+    data = dict(known.get("data") or {})
+    data.update(extras)
+    cid = known.get("company_id")
+    return {
+        "id": coerce_uuid(doc_id),
+        "company_id": coerce_uuid(cid) if cid else None,
+        "user_id": known.get("user_id"),
+        "assigned_to": known.get("assigned_to"),
+        "status": known.get("status"),
+        "priority": known.get("priority"),
+        "data": data,
+        **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
+        **({"updated_at": known["updated_at"]} if "updated_at" in known and known["updated_at"] is not None else {}),
+    }
+
+
+# ─── physical_health_checkins ─────────────────────────────────────────────────
+
+_PHC_COLS = {"user_id", "company_id", "vitals", "symptoms", "created_at"}
+
+
+def transform_physical_health_checkin(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _PHC_COLS)
+    vitals = dict(known.get("vitals") or {})
+    vitals.update(extras)
+    cid = known.get("company_id")
+    return {
+        "id": coerce_uuid(doc_id),
+        "user_id": known.get("user_id"),
+        "company_id": coerce_uuid(cid) if cid else None,
+        "vitals": vitals,
+        "symptoms": known.get("symptoms") or {},
+        **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
+    }
+
+
+# ─── physical_health_reports ──────────────────────────────────────────────────
+
+_PHR_COLS = {"user_id", "company_id", "report", "generated_at"}
+
+
+def transform_physical_health_report(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _PHR_COLS)
+    report = dict(known.get("report") or {})
+    report.update(extras)
+    cid = known.get("company_id")
+    return {
+        "id": coerce_uuid(doc_id),
+        "user_id": known.get("user_id"),
+        "company_id": coerce_uuid(cid) if cid else None,
+        "report": report,
+        **({"generated_at": known["generated_at"]} if "generated_at" in known and known["generated_at"] is not None else {}),
+    }
+
+
+# ─── medical_documents ────────────────────────────────────────────────────────
+
+_MD_COLS = {
+    "user_id", "filename", "blob_url", "mime_type", "size_bytes",
+    "extracted_text", "uploaded_at",
+}
+
+
+def transform_medical_document(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _MD_COLS)
+    _warn_dropped("medical_documents", doc_id, extras)
+    return {
+        "id": coerce_uuid(doc_id),
+        "user_id": known.get("user_id"),
+        "filename": known.get("filename") or "",
+        "blob_url": known.get("blob_url") or "",
+        "mime_type": known.get("mime_type"),
+        "size_bytes": known.get("size_bytes"),
+        "extracted_text": known.get("extracted_text"),
+        **({"uploaded_at": known["uploaded_at"]} if "uploaded_at" in known and known["uploaded_at"] is not None else {}),
+    }
+
+
+# ─── wellness_events ──────────────────────────────────────────────────────────
+
+_WE_COLS = {"user_id", "company_id", "event_type", "data", "created_at"}
+
+
+def transform_wellness_event(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _WE_COLS)
+    data = dict(known.get("data") or {})
+    data.update(extras)
+    cid = known.get("company_id")
+    return {
+        "id": coerce_uuid(doc_id),
+        "user_id": known.get("user_id"),
+        "company_id": coerce_uuid(cid) if cid else None,
+        "event_type": known.get("event_type"),
+        "data": data,
+        **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
+    }
+
+
+# ─── anonymous_profiles ───────────────────────────────────────────────────────
+
+_AP_COLS = {"user_id", "handle", "avatar", "created_at"}
+
+
+def transform_anonymous_profile(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _AP_COLS)
+    _warn_dropped("anonymous_profiles", doc_id, extras)
+    return {
+        "id": coerce_uuid(doc_id),
+        "user_id": known.get("user_id"),
+        "handle": known.get("handle") or doc_id,
+        "avatar": known.get("avatar"),
+        **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
+    }
+
+
+# ─── community_posts ──────────────────────────────────────────────────────────
+
+_CP_COLS = {
+    "company_id", "anonymous_profile_id", "content", "likes", "replies",
+    "is_approved", "created_at",
+}
+
+
+def transform_community_post(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _CP_COLS)
+    _warn_dropped("community_posts", doc_id, extras)
+    cid = known.get("company_id")
+    apid = known.get("anonymous_profile_id")
+    return {
+        "id": coerce_uuid(doc_id),
+        "company_id": coerce_uuid(cid) if cid else None,
+        "anonymous_profile_id": coerce_uuid(apid) if apid else None,
+        "content": known.get("content") or "",
+        "likes": int(known.get("likes") or 0),
+        "replies": int(known.get("replies") or 0),
+        "is_approved": known.get("is_approved") if "is_approved" in known else True,
+        **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
+    }
+
+
+# ─── community_replies ────────────────────────────────────────────────────────
+
+_CR_COLS = {"post_id", "anonymous_profile_id", "content", "is_approved", "created_at"}
+
+
+def transform_community_reply(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _CR_COLS)
+    _warn_dropped("community_replies", doc_id, extras)
+    pid = known.get("post_id")
+    apid = known.get("anonymous_profile_id")
+    return {
+        "id": coerce_uuid(doc_id),
+        "post_id": coerce_uuid(pid) if pid else None,
+        "anonymous_profile_id": coerce_uuid(apid) if apid else None,
+        "content": known.get("content") or "",
+        "is_approved": known.get("is_approved") if "is_approved" in known else True,
+        **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
+    }
+
+
+# ─── user_gamification ────────────────────────────────────────────────────────
+
+_UG_COLS = {
+    "user_id", "company_id", "points", "level", "badges", "streak", "updated_at",
+}
+
+
+def transform_user_gamification(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _UG_COLS)
+    _warn_dropped("user_gamification", doc_id, extras)
+    cid = known.get("company_id")
+    return {
+        "id": coerce_uuid(doc_id),
+        "user_id": known.get("user_id"),
+        "company_id": coerce_uuid(cid) if cid else None,
+        "points": int(known.get("points") or 0),
+        "level": int(known.get("level") or 1),
+        "badges": list(known.get("badges") or []),
+        "streak": int(known.get("streak") or 0),
+        **({"updated_at": known["updated_at"]} if "updated_at" in known and known["updated_at"] is not None else {}),
+    }
+
+
+# ─── wellness_challenges ──────────────────────────────────────────────────────
+
+_WC_COLS = {
+    "company_id", "title", "description", "is_active", "data",
+    "starts_at", "ends_at", "created_at",
+}
+
+
+def transform_wellness_challenge(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _WC_COLS)
+    data = dict(known.get("data") or {})
+    data.update(extras)
+    cid = known.get("company_id")
+    return {
+        "id": coerce_uuid(doc_id),
+        "company_id": coerce_uuid(cid) if cid else None,
+        "title": known.get("title") or "",
+        "description": known.get("description"),
+        "is_active": known.get("is_active") if "is_active" in known else True,
+        "data": data,
+        **({"starts_at": known["starts_at"]} if "starts_at" in known and known["starts_at"] is not None else {}),
+        **({"ends_at": known["ends_at"]} if "ends_at" in known and known["ends_at"] is not None else {}),
+        **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
+    }
+
+
+# ─── calls ────────────────────────────────────────────────────────────────────
+
+_CALL_COLS = {
+    "caller_id", "callee_id", "status", "start_time", "answered_at",
+    "end_time", "end_reason", "ended_by", "created_at", "updated_at",
+}
+
+
+def transform_call(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _CALL_COLS)
+    _warn_dropped("calls", doc_id, extras)
+    return {
+        "id": coerce_uuid(doc_id),
+        "caller_id": known.get("caller_id"),
+        "callee_id": known.get("callee_id"),
+        "status": known.get("status"),
+        "start_time": known.get("start_time"),
+        "answered_at": known.get("answered_at"),
+        "end_time": known.get("end_time"),
+        "end_reason": known.get("end_reason"),
+        "ended_by": known.get("ended_by"),
+        **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
+        **({"updated_at": known["updated_at"]} if "updated_at" in known and known["updated_at"] is not None else {}),
+    }
+
+
+# ─── call_sessions ────────────────────────────────────────────────────────────
+
+_CALLSESS_COLS = {"call_id", "status", "metadata", "created_at", "updated_at"}
+
+
+def transform_call_session(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _CALLSESS_COLS)
+    call_meta = dict(known.get("metadata") or {})
+    call_meta.update(extras)
+    call_id = known.get("call_id")
+    return {
+        "id": coerce_uuid(doc_id),
+        "call_id": coerce_uuid(call_id) if call_id else None,
+        "status": known.get("status"),
+        "call_metadata": call_meta,
+        **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
+        **({"updated_at": known["updated_at"]} if "updated_at" in known and known["updated_at"] is not None else {}),
+    }
+
+
+# ─── import_jobs ──────────────────────────────────────────────────────────────
+
+_IJ_COLS = {
+    "company_id", "created_by", "status", "stats", "errors", "blob_url",
+    "created_at", "updated_at",
+}
+
+
+def transform_import_job(doc_id: str, doc: dict) -> dict:
+    known, extras = split_known_and_extras(doc, _IJ_COLS)
+    stats = dict(known.get("stats") or {})
+    stats.update(extras)
+    cid = known.get("company_id")
+    return {
+        "id": coerce_uuid(doc_id),
+        "company_id": coerce_uuid(cid) if cid else None,
+        "created_by": known.get("created_by"),
+        "status": known.get("status"),
+        "stats": stats,
+        "errors": known.get("errors") or [],
+        "blob_url": known.get("blob_url"),
+        **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
+        **({"updated_at": known["updated_at"]} if "updated_at" in known and known["updated_at"] is not None else {}),
+    }
