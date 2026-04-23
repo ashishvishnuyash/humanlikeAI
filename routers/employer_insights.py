@@ -14,32 +14,167 @@ Privacy rules: same as employer_dashboard — no individual data ever.
 """
 
 import math
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
-from firebase_config import get_db
+from db.models import Company, MHSession, MentalHealthReport, User
+from db.session import get_session
 from routers.auth import get_current_user
-from routers.employer_dashboard import (
-    K_ANON_THRESHOLD,
-    utc_now,
-    _ts_to_dt,
-    _week_label,
-    _size_band,
-    _require_employer,
-    _fetch_company_check_ins,
-    _fetch_sessions,
-    _compute_team_size,
-    _fetch_wellness_events,
-)
 
-router = APIRouter(
-    prefix="/employer/insights",
-    tags=["Employer — Advanced Insights & Action Engine"],
-    dependencies=[Depends(get_current_user)],
-)
+# ─── Config ──────────────────────────────────────────────────────────────────
+K_ANON_THRESHOLD = 1          # suppress any cohort smaller than this
+
+# ─── Pure helpers (no DB) ─────────────────────────────────────────────────────
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _week_label(dt: datetime) -> str:
+    return dt.strftime("W%V %Y")
+
+
+def _ts_to_dt(ts) -> Optional[datetime]:
+    """Convert datetime (possibly naive) to UTC-aware datetime."""
+    if ts is None:
+        return None
+    if hasattr(ts, "timestamp"):
+        return datetime.fromtimestamp(ts.timestamp(), tz=timezone.utc)
+    if isinstance(ts, datetime):
+        return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _size_band(n: int) -> str:
+    if n < 5:
+        return "<5 (suppressed)"
+    if n < 10:
+        return "5–10"
+    if n < 25:
+        return "10–25"
+    if n < 50:
+        return "25–50"
+    if n < 100:
+        return "50–100"
+    return "100+"
+
+
+def _parse_company_uuid(company_id: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(company_id)
+    except ValueError:
+        raise HTTPException(400, f"Invalid company_id: {company_id!r}")
+
+
+# ─── DB helpers ──────────────────────────────────────────────────────────────
+
+def _require_employer(user_token: dict, db: Session) -> dict:
+    """Raise 403 if caller is not an employer, manager, or hr."""
+    uid = user_token.get("uid") or user_token.get("sub") or user_token.get("id", "")
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if not user:
+        raise HTTPException(403, "User profile not found")
+    if user.role not in ("employer", "manager", "hr"):
+        raise HTTPException(403, "Access restricted to employer accounts")
+    profile = {
+        "id": user.id,
+        "email": user.email,
+        "role": user.role,
+        "company_id": str(user.company_id) if user.company_id else None,
+    }
+    return profile
+
+
+def _compute_team_size(db: Session, company_id: uuid.UUID) -> int:
+    return (
+        db.query(User)
+        .filter(User.company_id == company_id, User.is_active == True)  # noqa: E712
+        .count()
+    )
+
+
+def _fetch_company_check_ins(db: Session, company_id: uuid.UUID, days: int = 90) -> List[dict]:
+    """Fetch mental health reports for a company in the last `days` days,
+    normalised to the check-in shape used across analytics endpoints:
+    mood_score, stress_level, user_id, company_id, created_at.
+    """
+    cutoff = utc_now() - timedelta(days=days)
+    rows = (
+        db.query(MentalHealthReport)
+        .filter(
+            MentalHealthReport.company_id == company_id,
+            MentalHealthReport.generated_at >= cutoff,
+        )
+        .all()
+    )
+    results = []
+    for r in rows:
+        report_data = r.report or {}
+        results.append({
+            "user_id": r.user_id,
+            "company_id": str(r.company_id),
+            "mood_score": report_data.get("mood_rating", report_data.get("mood_score", 5)),
+            "stress_level": report_data.get("stress_level", 5),
+            "created_at": r.generated_at,
+        })
+    return results
+
+
+def _fetch_sessions(db: Session, company_id: uuid.UUID, days: int = 90) -> List[dict]:
+    """Fetch MH sessions for a company in the last `days` days."""
+    cutoff = utc_now() - timedelta(days=days)
+    rows = (
+        db.query(MHSession)
+        .filter(
+            MHSession.company_id == company_id,
+            MHSession.created_at >= cutoff,
+        )
+        .all()
+    )
+    return [
+        {
+            "user_id": r.user_id,
+            "company_id": str(r.company_id),
+            "created_at": r.created_at,
+        }
+        for r in rows
+    ]
+
+
+def _fetch_wellness_events(db: Session, company_id: uuid.UUID, days: int = 90) -> List[dict]:
+    """Derive wellness events from mental health reports.
+    High-stress or high-risk reports → sentiment_negative_shift events.
+    """
+    cutoff = utc_now() - timedelta(days=days)
+    rows = (
+        db.query(MentalHealthReport)
+        .filter(
+            MentalHealthReport.company_id == company_id,
+            MentalHealthReport.generated_at >= cutoff,
+        )
+        .all()
+    )
+    results = []
+    for r in rows:
+        report_data = r.report or {}
+        stress = report_data.get("stress_level", 5)
+        risk = r.risk_level or "low"
+        if stress >= 7 or risk == "high":
+            results.append({
+                "event_type": "sentiment_negative_shift",
+                "company_id": str(r.company_id),
+                "created_at": r.generated_at,
+            })
+    return results
+
 
 # ─── Internal benchmark reference data ───────────────────────────────────────
 # These are anonymised, illustrative industry medians for context.
@@ -431,6 +566,21 @@ HR_PROGRAMS: Dict[str, HRProgramSuggestion] = {
 }
 
 
+# ─── Routers ─────────────────────────────────────────────────────────────────
+
+router = APIRouter(
+    prefix="/employer/insights",
+    tags=["Employer — Advanced Insights & Action Engine"],
+    dependencies=[Depends(get_current_user)],
+)
+
+actions_router = APIRouter(
+    prefix="/employer/actions",
+    tags=["Employer — Action Engine"],
+    dependencies=[Depends(get_current_user)],
+)
+
+
 # ─── Endpoints ───────────────────────────────────────────────────────────────
 
 @router.get(
@@ -443,20 +593,18 @@ async def get_predictive_trends(
     company_id: str = Query(...),
     forecast_weeks: int = Query(4, ge=1, le=8),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer(user_token, db)
     if profile.get("company_id") != company_id:
         raise HTTPException(403, "Access denied for this company")
 
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
-    team_size = _compute_team_size(company_id, db)
+    cid = _parse_company_uuid(company_id)
+    team_size = _compute_team_size(db, cid)
     if team_size < K_ANON_THRESHOLD:
         raise HTTPException(422, {"error": "insufficient_cohort", "suppressed": True})
 
-    check_ins = _fetch_company_check_ins(company_id, db, days=12 * 7)
+    check_ins = _fetch_company_check_ins(db, cid, days=12 * 7)
 
     # Group by week
     weekly: Dict[str, Dict[str, Any]] = {}
@@ -545,33 +693,35 @@ async def get_benchmarks(
     period_days: int = Query(30, ge=7, le=90),
     industry: Optional[str] = Query(None, description="tech / finance / healthcare / retail / education"),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer(user_token, db)
     if profile.get("company_id") != company_id:
         raise HTTPException(403, "Access denied for this company")
 
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
-    team_size = _compute_team_size(company_id, db)
+    cid = _parse_company_uuid(company_id)
+    team_size = _compute_team_size(db, cid)
     if team_size < K_ANON_THRESHOLD:
         raise HTTPException(422, {"error": "insufficient_cohort", "suppressed": True})
 
     # Detect industry from company profile if not provided
     if not industry:
         try:
-            company_docs = db.collection("companies").where("owner_id", "==", profile.get("id", "")).limit(1).stream()
-            for doc in company_docs:
-                industry = doc.to_dict().get("industry", "").lower()
-                break
+            company = (
+                db.query(Company)
+                .filter(Company.owner_id == profile.get("id", ""))
+                .limit(1)
+                .one_or_none()
+            )
+            if company and company.settings:
+                industry = (company.settings.get("industry") or "").lower() or None
         except Exception:
             pass
 
     bm = _get_benchmark(industry)
 
-    check_ins = _fetch_company_check_ins(company_id, db, days=period_days)
-    sessions  = _fetch_sessions(company_id, db, days=period_days)
+    check_ins = _fetch_company_check_ins(db, cid, days=period_days)
+    sessions  = _fetch_sessions(db, cid, days=period_days)
 
     moods    = [c.get("mood_score", 5) for c in check_ins if "mood_score" in c]
     stresses = [c.get("stress_level", 5) for c in check_ins if "stress_level" in c]
@@ -588,8 +738,6 @@ async def get_benchmarks(
 
     active_users = {s.get("user_id") for s in sessions}
     eng_pct = round(len(active_users) / team_size * 100, 1)
-
-    comparisons: List[BenchmarkComparison] = []
 
     def _cmp(metric: str, your_val: float, bm_val: float) -> BenchmarkComparison:
         delta = round(your_val - bm_val, 1)
@@ -636,28 +784,25 @@ async def get_cohorts(
     company_id: str = Query(...),
     period_days: int = Query(30, ge=7, le=90),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer(user_token, db)
     if profile.get("company_id") != company_id:
         raise HTTPException(403, "Access denied for this company")
 
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
-    team_size = _compute_team_size(company_id, db)
+    cid = _parse_company_uuid(company_id)
+    team_size = _compute_team_size(db, cid)
     if team_size < K_ANON_THRESHOLD:
         raise HTTPException(422, {"error": "insufficient_cohort", "suppressed": True})
 
     # Fetch all users with created_at (hire date proxy)
     try:
-        user_docs = db.collection("users").where("company_id", "==", company_id).stream()
-        users = [d.to_dict() for d in user_docs]
+        users = db.query(User).filter(User.company_id == cid).all()
     except Exception:
         users = []
 
-    check_ins = _fetch_company_check_ins(company_id, db, days=period_days)
-    sessions  = _fetch_sessions(company_id, db, days=period_days)
+    check_ins = _fetch_company_check_ins(db, cid, days=period_days)
+    sessions  = _fetch_sessions(db, cid, days=period_days)
 
     # User lookup: uid → tenure category
     now = utc_now()
@@ -676,7 +821,7 @@ async def get_cohorts(
         return "3+ years"
 
     uid_to_tenure: Dict[str, str] = {
-        u.get("id", u.get("uid", "")): _tenure_label(u.get("created_at"))
+        u.id: _tenure_label(u.created_at)
         for u in users
     }
 
@@ -743,15 +888,6 @@ async def get_cohorts(
     )
 
 
-# ─── Action Engine Routers ───────────────────────────────────────────────────
-
-actions_router = APIRouter(
-    prefix="/employer/actions",
-    tags=["Employer — Action Engine"],
-    dependencies=[Depends(get_current_user)],
-)
-
-
 @actions_router.post(
     "/manager-playbook",
     response_model=ManagerPlaybookResponse,
@@ -761,16 +897,11 @@ actions_router = APIRouter(
 async def get_manager_playbook(
     req: ManagerPlaybookRequest,
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer(user_token, db)
     if profile.get("company_id") != req.company_id:
         raise HTTPException(403, "Access denied for this company")
-
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
-    team_size = _compute_team_size(db.collection("users").where("company_id", "==", req.company_id).stream().__class__, db)
 
     pb = MANAGER_PLAYBOOKS.get(req.signal)
     if not pb:
@@ -778,9 +909,6 @@ async def get_manager_playbook(
             400,
             detail=f"Unknown signal '{req.signal}'. Valid signals: {list(MANAGER_PLAYBOOKS.keys())}",
         )
-
-    # Verify company has sufficient team size for any data-backed context
-    _compute_team_size(req.company_id, db)  # side-effect: validates DB access
 
     return ManagerPlaybookResponse(
         company_id=req.company_id,
@@ -804,8 +932,9 @@ async def get_manager_playbook(
 async def get_hr_playbook(
     req: HRPlaybookRequest,
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer(user_token, db)
     if profile.get("company_id") != req.company_id:
         raise HTTPException(403, "Access denied for this company")
 
