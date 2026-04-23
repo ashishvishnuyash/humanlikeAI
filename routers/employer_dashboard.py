@@ -13,17 +13,20 @@ import math
 import random
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
-from firebase_config import get_db
+from db.models import CheckIn, MHSession, MentalHealthReport, User
+from db.session import get_session
 from routers.auth import get_current_user
 
 # ─── Simple TTL Cache ─────────────────────────────────────────────────────
-# Prevents Firestore quota exhaustion when multiple dashboard endpoints
+# Prevents DB quota exhaustion when multiple dashboard endpoints
 # are called in parallel (each would otherwise independently read the
 # same user profile / company data).
 
@@ -66,7 +69,7 @@ def _week_label(dt: datetime) -> str:
 
 
 def _ts_to_dt(ts) -> Optional[datetime]:
-    """Convert Firestore Timestamp or ISO string to datetime."""
+    """Convert Firestore Timestamp, datetime, or ISO string to UTC-aware datetime."""
     if ts is None:
         return None
     if hasattr(ts, "timestamp"):
@@ -86,186 +89,182 @@ def _suppress(value: Any, count: int, threshold: int = K_ANON_THRESHOLD):
     return value
 
 
-def _get_employer_role(uid: str, db) -> Optional[dict]:
-    """Fetch the caller's profile; ensure role == employer or manager."""
+def _require_employer(user_token: dict, db: Session) -> dict:
+    """Raise 403 if caller is not an employer, manager, or HR."""
+    uid = user_token["uid"]
     cache_key = f"employer_role:{uid}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
-    try:
-        doc = db.collection("users").document(uid).get()
-        if not doc.exists:
-            return None
-        profile = doc.to_dict()
-        _cache_set(cache_key, profile)
-        return profile
-    except Exception as e:
-        print(f"[employer_dashboard] employer role fetch error: {e}")
-        return None
-
-
-def _require_employer(user_token: dict):
-    """Raise 403 if caller is not an employer or manager."""
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-    profile = _get_employer_role(user_token["uid"], db)
-    if not profile:
-        raise HTTPException(403, "User profile not found")
-    if profile.get("role") not in ("employer", "manager", "hr"):
-        raise HTTPException(403, "Access restricted to employer accounts")
+    u = db.query(User).filter(User.id == uid).one_or_none()
+    if u is None or u.role not in ("employer", "manager", "hr"):
+        raise HTTPException(403, "Employer/HR access required")
+    profile = {
+        "uid": u.id,
+        "email": u.email,
+        "role": u.role,
+        "company_id": str(u.company_id) if u.company_id else None,
+    }
+    _cache_set(cache_key, profile)
     return profile
 
 
-# ─── Firestore Aggregation Helpers ──────────────────────────────────────────
+# ─── SQLAlchemy Aggregation Helpers ──────────────────────────────────────────
 
-def _fetch_company_user_ids(company_id: str, db) -> List[str]:
-    """Return all user IDs belonging to a company."""
-    cache_key = f"user_ids:{company_id}"
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
+def _parse_company_uuid(company_id: str) -> uuid.UUID:
+    """Parse company_id string to UUID, raising HTTP 400 on failure."""
     try:
-        docs = db.collection("users").where("company_id", "==", company_id).stream()
-        ids = []
-        for doc in docs:
-            d = doc.to_dict()
-            uid = d.get("id") or doc.id
-            if uid:
-                ids.append(uid)
-        _cache_set(cache_key, ids)
-        return ids
-    except Exception as e:
-        print(f"[employer_dashboard] user_ids fetch error: {e}")
-        return []
+        return uuid.UUID(company_id)
+    except ValueError:
+        raise HTTPException(400, f"Invalid company_id: {company_id!r}")
 
 
-def _fetch_company_check_ins(company_id: str, db, days: int = 90) -> List[dict]:
-    """Fetch mental health reports for a company in the last `days` days.
+def _fetch_company_check_ins(
+    company_id: str, db: Session, days: int = 90
+) -> List[dict]:
+    """Fetch check-ins for a company (last `days` days) from Postgres.
 
-    Reads from `mental_health_reports` collection (the actual data source)
-    and normalises fields to the check-in format the dashboard expects:
+    Normalises fields to the check-in format the dashboard expects:
       mood_score, stress_level, user_id, company_id, created_at.
     Uses a TTL cache keyed on (company_id, days) to avoid duplicate
-    Firestore reads when multiple endpoints run in parallel.
+    DB reads when multiple endpoints run in parallel.
     """
     cache_key = f"check_ins:{company_id}:{days}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
+    cid_uuid = _parse_company_uuid(company_id)
     cutoff = utc_now() - timedelta(days=days)
     try:
-        docs = (
-            db.collection("mental_health_reports")
-            .where("company_id", "==", company_id)
-            .limit(5000)
-            .stream()
+        rows = (
+            db.query(CheckIn)
+            .filter(
+                CheckIn.company_id == cid_uuid,
+                CheckIn.created_at >= cutoff,
+            )
+            .all()
         )
         results = []
-        for d in docs:
-            data = d.to_dict()
-            ts = _ts_to_dt(data.get("created_at"))
-            if ts and ts >= cutoff:
-                results.append({
-                    "user_id": data.get("employee_id"),
-                    "company_id": company_id,
-                    "mood_score": data.get("mood_rating", 5),
-                    "stress_level": data.get("stress_level", 5),
-                    "created_at": data.get("created_at"),
-                })
+        for r in rows:
+            d = r.data or {}
+            results.append({
+                "user_id": r.user_id,
+                "company_id": company_id,
+                "mood_score": d.get("mood_score", d.get("mood_rating", 5)),
+                "stress_level": d.get("stress_level", 5),
+                "created_at": r.created_at,
+            })
         _cache_set(cache_key, results)
         return results
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"[employer_dashboard] mental_health_reports fetch error: {e}")
+        print(f"[employer_dashboard] check-ins fetch error: {e}")
         return []
 
 
-def _fetch_sessions(company_id: str, db, days: int = 90) -> List[dict]:
-    """Fetch chat session records for a company in the last `days` days.
+def _fetch_sessions(
+    company_id: str, db: Session, days: int = 90
+) -> List[dict]:
+    """Fetch MH session records for a company (last `days` days) from Postgres.
 
-    Reads from `chat_sessions` collection (the actual data source)
-    and normalises fields to the session format the dashboard expects.
-    Uses a TTL cache to avoid duplicate Firestore reads.
+    Normalises fields to the session format the dashboard expects:
+      user_id, company_id, created_at, duration_minutes.
+    Uses a TTL cache to avoid duplicate DB reads.
     """
     cache_key = f"sessions:{company_id}:{days}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
+    cid_uuid = _parse_company_uuid(company_id)
     cutoff = utc_now() - timedelta(days=days)
     try:
-        docs = (
-            db.collection("chat_sessions")
-            .where("company_id", "==", company_id)
-            .limit(5000)
-            .stream()
+        rows = (
+            db.query(MHSession)
+            .filter(
+                MHSession.company_id == cid_uuid,
+                MHSession.created_at >= cutoff,
+            )
+            .all()
         )
         results = []
-        for d in docs:
-            data = d.to_dict()
-            ts = _ts_to_dt(data.get("created_at"))
-            if ts and ts >= cutoff:
-                results.append({
-                    "user_id": data.get("employee_id"),
-                    "company_id": company_id,
-                    "created_at": data.get("created_at"),
-                    "duration_minutes": data.get("session_duration_minutes", 5),
-                })
+        for r in rows:
+            # Estimate duration from ended_at - created_at, default 5 min
+            duration_minutes = 5
+            if r.ended_at and r.created_at:
+                delta = (r.ended_at - r.created_at).total_seconds() / 60
+                if delta > 0:
+                    duration_minutes = delta
+            results.append({
+                "user_id": r.user_id,
+                "company_id": company_id,
+                "created_at": r.created_at,
+                "duration_minutes": duration_minutes,
+            })
         _cache_set(cache_key, results)
         return results
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"[employer_dashboard] chat_sessions fetch error: {e}")
+        print(f"[employer_dashboard] sessions fetch error: {e}")
         return []
 
 
-def _fetch_wellness_events(company_id: str, db, days: int = 90) -> List[dict]:
+def _fetch_wellness_events(
+    company_id: str, db: Session, days: int = 90
+) -> List[dict]:
     """Derive wellness events from mental health reports.
 
-    High-stress or high-risk reports are mapped to sentiment_negative_shift events
-    since no dedicated wellness_events collection exists.
+    High-stress or high-risk reports are mapped to sentiment_negative_shift events.
     """
+    cid_uuid = _parse_company_uuid(company_id)
     cutoff = utc_now() - timedelta(days=days)
     try:
-        docs = (
-            db.collection("mental_health_reports")
-            .where("company_id", "==", company_id)
-            .limit(5000)
-            .stream()
+        rows = (
+            db.query(MentalHealthReport)
+            .filter(
+                MentalHealthReport.company_id == cid_uuid,
+                MentalHealthReport.generated_at >= cutoff,
+            )
+            .all()
         )
         results = []
-        for d in docs:
-            data = d.to_dict()
-            ts = _ts_to_dt(data.get("created_at"))
-            if ts and ts >= cutoff:
-                stress = data.get("stress_level", 5)
-                risk = data.get("risk_level", "low")
-                if stress >= 7 or risk == "high":
-                    results.append({
-                        "event_type": "sentiment_negative_shift",
-                        "company_id": company_id,
-                        "created_at": data.get("created_at"),
-                    })
+        for r in rows:
+            report_data = r.report or {}
+            stress = report_data.get("stress_level", 5)
+            risk = r.risk_level or report_data.get("risk_level", "low")
+            if stress >= 7 or risk == "high":
+                results.append({
+                    "event_type": "sentiment_negative_shift",
+                    "company_id": company_id,
+                    "created_at": r.generated_at,
+                })
         return results
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[employer_dashboard] wellness_events derivation error: {e}")
         return []
 
 
-def _compute_team_size(company_id: str, db) -> int:
+def _compute_team_size(company_id: str, db: Session) -> int:
     cache_key = f"team_size:{company_id}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
+    cid_uuid = _parse_company_uuid(company_id)
     try:
-        docs = (
-            db.collection("users")
-            .where("company_id", "==", company_id)
-            .stream()
+        size = (
+            db.query(User)
+            .filter(User.company_id == cid_uuid, User.is_active == True)  # noqa: E712
+            .count()
         )
-        size = sum(1 for _ in docs)
         _cache_set(cache_key, size)
         return size
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[employer_dashboard] team size error: {e}")
         return 0
@@ -394,15 +393,12 @@ async def get_wellness_index(
     company_id: str = Query(..., description="Company identifier"),
     period_days: int = Query(30, ge=7, le=90),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer(user_token, db)
     # Ensure the caller belongs to this company
     if profile.get("company_id") != company_id:
         raise HTTPException(403, "Access denied for this company")
-
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
 
     check_ins = _fetch_company_check_ins(company_id, db, days=period_days)
     team_size = _compute_team_size(company_id, db)
@@ -486,14 +482,11 @@ async def get_burnout_trend(
     company_id: str = Query(...),
     weeks: int = Query(8, ge=1, le=ROLLING_WEEKS),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer(user_token, db)
     if profile.get("company_id") != company_id:
         raise HTTPException(403, "Access denied for this company")
-
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
 
     check_ins = _fetch_company_check_ins(company_id, db, days=weeks * 7)
     team_size = _compute_team_size(company_id, db)
@@ -581,14 +574,11 @@ async def get_engagement_signals(
     company_id: str = Query(...),
     period_days: int = Query(30, ge=7, le=90),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer(user_token, db)
     if profile.get("company_id") != company_id:
         raise HTTPException(403, "Access denied for this company")
-
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
 
     team_size = _compute_team_size(company_id, db)
     if team_size < K_ANON_THRESHOLD:
@@ -634,14 +624,11 @@ async def get_workload_friction(
     company_id: str = Query(...),
     period_days: int = Query(30, ge=7, le=90),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer(user_token, db)
     if profile.get("company_id") != company_id:
         raise HTTPException(403, "Access denied for this company")
-
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
 
     team_size = _compute_team_size(company_id, db)
     if team_size < K_ANON_THRESHOLD:
@@ -657,7 +644,7 @@ async def get_workload_friction(
     ]
     late_pct = round(len(late_night) / max(1, len(sessions)) * 100, 1) if sessions else 0.0
 
-    # Sentiment shift events flagged in wellness_events collection
+    # Sentiment shift events flagged in wellness_events
     sentiment_events = [e for e in events if e.get("event_type") == "sentiment_negative_shift"]
     # Bucket the count to avoid leaking exact figures for tiny teams
     bucketed_count = (len(sentiment_events) // 5) * 5  # round down to nearest 5
@@ -687,14 +674,11 @@ async def get_productivity_proxy(
     company_id: str = Query(...),
     weeks: int = Query(8, ge=1, le=ROLLING_WEEKS),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer(user_token, db)
     if profile.get("company_id") != company_id:
         raise HTTPException(403, "Access denied for this company")
-
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
 
     team_size = _compute_team_size(company_id, db)
     if team_size < K_ANON_THRESHOLD:
@@ -742,14 +726,11 @@ async def get_early_warnings(
     company_id: str = Query(...),
     period_days: int = Query(14, ge=7, le=30),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer(user_token, db)
     if profile.get("company_id") != company_id:
         raise HTTPException(403, "Access denied for this company")
-
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
 
     team_size = _compute_team_size(company_id, db)
     if team_size < K_ANON_THRESHOLD:
@@ -889,14 +870,11 @@ PLAYBOOKS: Dict[str, SuggestedAction] = {
 async def get_suggested_actions(
     company_id: str = Query(...),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer(user_token, db)
     if profile.get("company_id") != company_id:
         raise HTTPException(403, "Access denied for this company")
-
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
 
     team_size = _compute_team_size(company_id, db)
     if team_size < K_ANON_THRESHOLD:
