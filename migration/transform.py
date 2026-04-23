@@ -60,6 +60,22 @@ def split_known_and_extras(doc: dict, known_cols: Iterable[str]) -> Tuple[dict, 
     return known, extras
 
 
+def apply_aliases(doc: dict, aliases: dict) -> dict:
+    """Return a new dict with keys renamed per ``aliases`` (old_key -> new_key).
+
+    If the target key already exists in ``doc``, the aliased value is skipped
+    (source of truth wins). Missing alias keys are no-ops.
+    """
+    result = dict(doc)
+    for old_key, new_key in aliases.items():
+        if old_key in result and new_key not in result:
+            result[new_key] = result.pop(old_key)
+        elif old_key in result:
+            # Target key already populated — drop the alias duplicate silently.
+            result.pop(old_key)
+    return result
+
+
 def _warn_dropped(table: str, doc_id: str, extras: dict) -> None:
     if extras:
         print(
@@ -194,16 +210,22 @@ def transform_mental_health_report(doc_id: str, doc: dict) -> dict:
 
 # ─── chat_sessions ────────────────────────────────────────────────────────────
 
-_CS_COLS = {"user_id", "messages", "created_at", "updated_at"}
+_CS_COLS = {"user_id", "messages", "extras", "created_at", "updated_at"}
+_CS_ALIASES = {"employee_id": "user_id"}
 
 
 def transform_chat_session(doc_id: str, doc: dict) -> dict:
+    doc = apply_aliases(doc, _CS_ALIASES)
     known, extras = split_known_and_extras(doc, _CS_COLS)
-    _warn_dropped("chat_sessions", doc_id, extras)
+    # Unknown Firestore fields (e.g. report, company_id, status, session_type,
+    # completed_at, duration, conversationData) land in the extras JSONB.
+    merged_extras = dict(known.get("extras") or {})
+    merged_extras.update(extras)
     return {
         "id": coerce_uuid(doc_id),
         "user_id": known.get("user_id"),
         "messages": known.get("messages") or [],
+        "extras": merged_extras,
         **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
         **({"updated_at": known["updated_at"]} if "updated_at" in known and known["updated_at"] is not None else {}),
     }
@@ -359,17 +381,25 @@ def transform_wellness_event(doc_id: str, doc: dict) -> dict:
 
 # ─── anonymous_profiles ───────────────────────────────────────────────────────
 
-_AP_COLS = {"user_id", "handle", "avatar", "created_at"}
+_AP_COLS = {"user_id", "handle", "avatar", "extras", "created_at"}
+_AP_ALIASES = {
+    "employee_id": "user_id",
+    "anonymous_id": "handle",  # legacy field name for the user's handle
+    "avatar_color": "avatar",  # legacy: stored color string as avatar
+}
 
 
 def transform_anonymous_profile(doc_id: str, doc: dict) -> dict:
+    doc = apply_aliases(doc, _AP_ALIASES)
     known, extras = split_known_and_extras(doc, _AP_COLS)
-    _warn_dropped("anonymous_profiles", doc_id, extras)
+    merged_extras = dict(known.get("extras") or {})
+    merged_extras.update(extras)
     return {
         "id": coerce_uuid(doc_id),
         "user_id": known.get("user_id"),
         "handle": known.get("handle") or doc_id,
         "avatar": known.get("avatar"),
+        "extras": merged_extras,
         **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
     }
 
@@ -378,13 +408,16 @@ def transform_anonymous_profile(doc_id: str, doc: dict) -> dict:
 
 _CP_COLS = {
     "company_id", "anonymous_profile_id", "content", "likes", "replies",
-    "is_approved", "created_at",
+    "is_approved", "extras", "created_at",
 }
+_CP_ALIASES = {"author_id": "anonymous_profile_id"}
 
 
 def transform_community_post(doc_id: str, doc: dict) -> dict:
+    doc = apply_aliases(doc, _CP_ALIASES)
     known, extras = split_known_and_extras(doc, _CP_COLS)
-    _warn_dropped("community_posts", doc_id, extras)
+    merged_extras = dict(known.get("extras") or {})
+    merged_extras.update(extras)
     cid = known.get("company_id")
     apid = known.get("anonymous_profile_id")
     return {
@@ -395,18 +428,22 @@ def transform_community_post(doc_id: str, doc: dict) -> dict:
         "likes": int(known.get("likes") or 0),
         "replies": int(known.get("replies") or 0),
         "is_approved": known.get("is_approved") if "is_approved" in known else True,
+        "extras": merged_extras,
         **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
     }
 
 
 # ─── community_replies ────────────────────────────────────────────────────────
 
-_CR_COLS = {"post_id", "anonymous_profile_id", "content", "is_approved", "created_at"}
+_CR_COLS = {"post_id", "anonymous_profile_id", "content", "is_approved", "extras", "created_at"}
+_CR_ALIASES = {"author_id": "anonymous_profile_id"}
 
 
 def transform_community_reply(doc_id: str, doc: dict) -> dict:
+    doc = apply_aliases(doc, _CR_ALIASES)
     known, extras = split_known_and_extras(doc, _CR_COLS)
-    _warn_dropped("community_replies", doc_id, extras)
+    merged_extras = dict(known.get("extras") or {})
+    merged_extras.update(extras)
     pid = known.get("post_id")
     apid = known.get("anonymous_profile_id")
     return {
@@ -415,6 +452,7 @@ def transform_community_reply(doc_id: str, doc: dict) -> dict:
         "anonymous_profile_id": coerce_uuid(apid) if apid else None,
         "content": known.get("content") or "",
         "is_approved": known.get("is_approved") if "is_approved" in known else True,
+        "extras": merged_extras,
         **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
     }
 
@@ -422,13 +460,23 @@ def transform_community_reply(doc_id: str, doc: dict) -> dict:
 # ─── user_gamification ────────────────────────────────────────────────────────
 
 _UG_COLS = {
-    "user_id", "company_id", "points", "level", "badges", "streak", "updated_at",
+    "user_id", "company_id", "points", "level", "badges", "streak",
+    "extras", "updated_at",
+}
+_UG_ALIASES = {
+    "employee_id": "user_id",
+    "total_points": "points",
+    "current_streak": "streak",
 }
 
 
 def transform_user_gamification(doc_id: str, doc: dict) -> dict:
+    doc = apply_aliases(doc, _UG_ALIASES)
     known, extras = split_known_and_extras(doc, _UG_COLS)
-    _warn_dropped("user_gamification", doc_id, extras)
+    # Unknown fields (longest_streak, last_check_in, monthly_goal, weekly_goal,
+    # challenges_completed, created_at) land in extras.
+    merged_extras = dict(known.get("extras") or {})
+    merged_extras.update(extras)
     cid = known.get("company_id")
     return {
         "id": coerce_uuid(doc_id),
@@ -438,6 +486,7 @@ def transform_user_gamification(doc_id: str, doc: dict) -> dict:
         "level": int(known.get("level") or 1),
         "badges": list(known.get("badges") or []),
         "streak": int(known.get("streak") or 0),
+        "extras": merged_extras,
         **({"updated_at": known["updated_at"]} if "updated_at" in known and known["updated_at"] is not None else {}),
     }
 
@@ -472,13 +521,30 @@ def transform_wellness_challenge(doc_id: str, doc: dict) -> dict:
 
 _CALL_COLS = {
     "caller_id", "callee_id", "status", "start_time", "answered_at",
-    "end_time", "end_reason", "ended_by", "created_at", "updated_at",
+    "end_time", "end_reason", "ended_by", "extras", "created_at", "updated_at",
+}
+# Firestore voice-calls stored data in camelCase and used `receiverId` for
+# the callee — normalise to snake_case + the schema's `callee_id` name.
+_CALL_ALIASES = {
+    "callerId": "caller_id",
+    "calleeId": "callee_id",
+    "receiverId": "callee_id",
+    "startTime": "start_time",
+    "answeredAt": "answered_at",
+    "endTime": "end_time",
+    "endReason": "end_reason",
+    "endedBy": "ended_by",
+    "createdAt": "created_at",
+    "updatedAt": "updated_at",
 }
 
 
 def transform_call(doc_id: str, doc: dict) -> dict:
+    doc = apply_aliases(doc, _CALL_ALIASES)
     known, extras = split_known_and_extras(doc, _CALL_COLS)
-    _warn_dropped("calls", doc_id, extras)
+    # Stuff remaining camelCase fields (e.g. callType, metadata) into extras.
+    merged_extras = dict(known.get("extras") or {})
+    merged_extras.update(extras)
     return {
         "id": coerce_uuid(doc_id),
         "caller_id": known.get("caller_id"),
@@ -489,6 +555,7 @@ def transform_call(doc_id: str, doc: dict) -> dict:
         "end_time": known.get("end_time"),
         "end_reason": known.get("end_reason"),
         "ended_by": known.get("ended_by"),
+        "extras": merged_extras,
         **({"created_at": known["created_at"]} if "created_at" in known and known["created_at"] is not None else {}),
         **({"updated_at": known["updated_at"]} if "updated_at" in known and known["updated_at"] is not None else {}),
     }
