@@ -14,11 +14,11 @@ All endpoints require JWT with role == employer (only the account owner).
 HR users can read profile/company but cannot mutate or delete.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from firebase_admin import auth as fb_auth, firestore as admin_firestore
 from firebase_config import get_db, firebaseConfig
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
@@ -32,6 +32,12 @@ _Increment = admin_firestore.firestore.Increment
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _safe_int(val, default: int = 0) -> int:
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
 
 def _ts_to_iso(ts) -> Optional[str]:
     if ts is None:
@@ -559,3 +565,393 @@ async def delete_employer_account(
         success=True,
         message="Employer account and company deleted permanently.",
     )
+
+
+# ─── GET /employer/team-usage ─────────────────────────────────────────────────
+
+@router.get(
+    "/team-usage",
+    summary="Per-Employee Engagement Summary",
+    description=(
+        "**Employer / HR only.** Returns engagement activity per employee for the "
+        "caller's company. Privacy-safe: activity counts and engagement metrics only — "
+        "no conversation content, no wellness scores, no cost data."
+    ),
+)
+async def team_usage(
+    days:       int            = Query(30, ge=1, le=365, description="Look-back window in days"),
+    department: Optional[str]  = Query(None, description="Filter by department"),
+    status:     Optional[str]  = Query(None, description="active | dormant | churned"),
+    sort_by:    str            = Query("engagementScore", description="engagementScore | lastActive | sessions | checkIns | streak"),
+    page:       int            = Query(1, ge=1),
+    limit:      int            = Query(20, ge=1, le=100),
+    employer: dict = Depends(get_employer_user),
+):
+    company_id = employer.get("company_id")
+    db = get_db()
+    if not db:
+        raise HTTPException(503, "Database unavailable")
+
+    now    = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+
+    # ── 1. All active employees in this company ───────────────────────────
+    try:
+        emp_docs = list(
+            db.collection("users")
+            .where("company_id", "==", company_id)
+            .where("is_active",  "==", True)
+            .stream()
+        )
+    except Exception as e:
+        raise HTTPException(500, f"users query failed: {e}")
+
+    employees: Dict[str, dict] = {}
+    for doc in emp_docs:
+        d = doc.to_dict()
+        if d.get("role") in ("employer", "super_admin"):
+            continue
+        if department and (d.get("department") or "").lower() != department.lower():
+            continue
+        employees[doc.id] = d
+
+    if not employees:
+        return {
+            "companyId": company_id, "windowDays": days,
+            "employees": [], "total": 0, "page": page, "limit": limit,
+            "totalPages": 1, "hasNext": False, "hasPrev": False,
+            "summary": {
+                "totalEmployees": 0, "activeCount": 0,
+                "dormantCount": 0, "churnedCount": 0,
+                "avgEngagementScore": 0.0, "participationRatePct": 0.0,
+            },
+        }
+
+    # ── 2. Batch-fetch activity data (all company-scoped, single query each) ──
+
+    session_counts:  Dict[str, int] = {}
+    try:
+        for doc in (
+            db.collection("chat_sessions")
+            .where("company_id", "==", company_id)
+            .where("started_at", ">=", cutoff)
+            .stream()
+        ):
+            uid = doc.to_dict().get("user_id", "")
+            if uid:
+                session_counts[uid] = session_counts.get(uid, 0) + 1
+    except Exception as e:
+        print(f"[team_usage] chat_sessions error: {e}")
+
+    checkin_counts: Dict[str, int] = {}
+    try:
+        for doc in (
+            db.collection("check_ins")
+            .where("company_id", "==", company_id)
+            .where("created_at", ">=", cutoff)
+            .stream()
+        ):
+            uid = doc.to_dict().get("user_id", "")
+            if uid:
+                checkin_counts[uid] = checkin_counts.get(uid, 0) + 1
+    except Exception as e:
+        print(f"[team_usage] check_ins error: {e}")
+
+    physical_counts: Dict[str, int] = {}
+    try:
+        for doc in (
+            db.collection("physical_health_checkins")
+            .where("company_id", "==", company_id)
+            .where("created_at", ">=", cutoff)
+            .stream()
+        ):
+            uid = doc.to_dict().get("user_id", "")
+            if uid:
+                physical_counts[uid] = physical_counts.get(uid, 0) + 1
+    except Exception as e:
+        print(f"[team_usage] physical_health_checkins error: {e}")
+
+    # Features used — privacy-safe: feature names only, no content/cost
+    features_used: Dict[str, set] = {}
+    try:
+        for doc in (
+            db.collection("usage_logs")
+            .where("company_id", "==", company_id)
+            .where("timestamp",  ">=", cutoff)
+            .stream()
+        ):
+            d    = doc.to_dict()
+            uid  = d.get("user_id", "")
+            feat = d.get("feature", "")
+            if uid and feat:
+                if uid not in features_used:
+                    features_used[uid] = set()
+                features_used[uid].add(feat)
+    except Exception as e:
+        print(f"[team_usage] usage_logs error: {e}")
+
+    # Gamification — current state, no time filter
+    gam_map: Dict[str, dict] = {}
+    try:
+        for doc in (
+            db.collection("user_gamification")
+            .where("company_id", "==", company_id)
+            .stream()
+        ):
+            d   = doc.to_dict()
+            uid = d.get("employee_id", "")
+            if uid:
+                gam_map[uid] = d
+    except Exception as e:
+        print(f"[team_usage] user_gamification error: {e}")
+
+    # ── 3. Per-employee helpers ───────────────────────────────────────────
+
+    def _activity_status(last_active_at) -> str:
+        if last_active_at is None:
+            return "churned"
+        try:
+            if hasattr(last_active_at, "timestamp"):
+                dt = datetime.fromtimestamp(last_active_at.timestamp(), tz=timezone.utc)
+            elif isinstance(last_active_at, datetime):
+                dt = last_active_at if last_active_at.tzinfo else last_active_at.replace(tzinfo=timezone.utc)
+            else:
+                return "churned"
+            days_since = (now - dt).days
+            if days_since <= 7:   return "active"
+            if days_since <= 30:  return "dormant"
+            return "churned"
+        except Exception:
+            return "churned"
+
+    def _days_ago(ts) -> Optional[int]:
+        if ts is None:
+            return None
+        try:
+            if hasattr(ts, "timestamp"):
+                dt = datetime.fromtimestamp(ts.timestamp(), tz=timezone.utc)
+            elif isinstance(ts, datetime):
+                dt = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+            else:
+                return None
+            return max(0, (now - dt).days)
+        except Exception:
+            return None
+
+    def _engagement_score(sessions: int, checkins: int, streak: int) -> float:
+        """
+        (sessions/days × 40%) + (checkins/days × 40%) + (streak/30 × 20%)
+        Capped at 100, rounded to 1 decimal.
+        """
+        s = min(sessions / days, 1.0) * 40
+        c = min(checkins / days, 1.0) * 40
+        t = min(streak   / 30,   1.0) * 20
+        return round(min(s + c + t, 100.0), 1)
+
+    # ── 4. Build per-employee records ─────────────────────────────────────
+    result = []
+    for uid, udata in employees.items():
+        sessions   = session_counts.get(uid, 0)
+        checkins   = checkin_counts.get(uid, 0)
+        physical   = physical_counts.get(uid, 0)
+        feats      = sorted(features_used.get(uid, set()))
+        gam        = gam_map.get(uid, {})
+        streak     = int(gam.get("current_streak", 0))
+        level      = int(gam.get("level", 1))
+        last_at    = udata.get("last_active_at")
+        act_status = _activity_status(last_at)
+
+        if status and act_status != status:
+            continue
+
+        score = _engagement_score(sessions, checkins, streak)
+
+        result.append({
+            "uid":                     uid,
+            "firstName":               udata.get("first_name", ""),
+            "lastName":                udata.get("last_name", ""),
+            "department":              udata.get("department"),
+            "position":                udata.get("position"),
+            "role":                    udata.get("role", "employee"),
+            "activityStatus":          act_status,
+            "lastActiveDaysAgo":       _days_ago(last_at),
+            "sessionsLast30d":         sessions,
+            "checkInsLast30d":         checkins,
+            "physicalCheckInsLast30d": physical,
+            "featuresUsed":            feats,
+            "gamificationLevel":       level,
+            "currentStreak":           streak,
+            "engagementScore":         score,
+        })
+
+    # ── 5. Sort ───────────────────────────────────────────────────────────
+    sort_key_map = {
+        "engagementScore": (lambda r: r["engagementScore"],         True),
+        "lastActive":      (lambda r: r["lastActiveDaysAgo"] or 9999, False),
+        "sessions":        (lambda r: r["sessionsLast30d"],           True),
+        "checkIns":        (lambda r: r["checkInsLast30d"],           True),
+        "streak":          (lambda r: r["currentStreak"],             True),
+    }
+    key_fn, reverse = sort_key_map.get(sort_by, sort_key_map["engagementScore"])
+    result.sort(key=key_fn, reverse=reverse)
+
+    # ── 6. Summary ────────────────────────────────────────────────────────
+    total         = len(result)
+    active_count  = sum(1 for r in result if r["activityStatus"] == "active")
+    dormant_count = sum(1 for r in result if r["activityStatus"] == "dormant")
+    churned_count = sum(1 for r in result if r["activityStatus"] == "churned")
+    avg_score     = round(sum(r["engagementScore"] for r in result) / total, 1) if total else 0.0
+    participation = round(active_count / total * 100, 1) if total else 0.0
+
+    # ── 7. Paginate ───────────────────────────────────────────────────────
+    offset      = (page - 1) * limit
+    total_pages = max(1, (total + limit - 1) // limit)
+
+    return {
+        "companyId":  company_id,
+        "windowDays": days,
+        "employees":  result[offset: offset + limit],
+        "total":      total,
+        "page":       page,
+        "limit":      limit,
+        "totalPages": total_pages,
+        "hasNext":    offset + limit < total,
+        "hasPrev":    page > 1,
+        "summary": {
+            "totalEmployees":       total,
+            "activeCount":          active_count,
+            "dormantCount":         dormant_count,
+            "churnedCount":         churned_count,
+            "avgEngagementScore":   avg_score,
+            "participationRatePct": participation,
+        },
+    }
+
+
+# ─── GET /employer/gamification ───────────────────────────────────────────────
+
+@router.get(
+    "/gamification",
+    summary="Company Gamification Overview + Anonymous Leaderboard",
+    description=(
+        "**Employer / HR only.** Returns gamification stats and an anonymous leaderboard "
+        "for the caller's company. Real names are never exposed — uses anonymous display names."
+    ),
+)
+async def employer_gamification(
+    employer: dict = Depends(get_employer_user),
+):
+    company_id = employer.get("company_id")
+    db = get_db()
+    if not db:
+        raise HTTPException(503, "Database unavailable")
+
+    # ── All gamification docs for this company ────────────────────────────
+    gam_docs = []
+    try:
+        gam_docs = list(
+            db.collection("user_gamification")
+            .where("company_id", "==", company_id)
+            .stream()
+        )
+    except Exception as e:
+        raise HTTPException(500, f"user_gamification query failed: {e}")
+
+    if not gam_docs:
+        return {
+            "companyId": company_id,
+            "totalPlayers": 0, "activePlayers7d": 0,
+            "avgPoints": 0.0, "avgLevel": 0.0, "avgStreak": 0.0,
+            "badgeDistribution": {}, "leaderboard": [],
+            "activeChallenges": [],
+        }
+
+    now       = datetime.now(timezone.utc)
+    cutoff_7d = now - timedelta(days=7)
+
+    total_pts = total_lvl = total_streak = active_7d = 0
+    badge_dist: Dict[str, int] = {}
+    leaderboard_raw = []
+
+    # Anonymous profile map
+    anon_map: Dict[str, str] = {}
+    try:
+        for doc in (
+            db.collection("anonymous_profiles")
+            .where("company_id", "==", company_id)
+            .stream()
+        ):
+            d = doc.to_dict()
+            anon_map[d.get("employee_id", "")] = d.get("display_name", "User ???")
+    except Exception:
+        pass
+
+    for doc in gam_docs:
+        d    = doc.to_dict()
+        uid  = d.get("employee_id", "")
+        pts  = _safe_int(d.get("total_points"))
+        lvl  = _safe_int(d.get("level", 1))
+        str_ = _safe_int(d.get("current_streak"))
+
+        total_pts    += pts
+        total_lvl    += lvl
+        total_streak += str_
+
+        for badge in d.get("badges", []):
+            badge_dist[badge] = badge_dist.get(badge, 0) + 1
+
+        lci = d.get("last_check_in")
+        if lci and hasattr(lci, "timestamp"):
+            dt = datetime.fromtimestamp(lci.timestamp(), tz=timezone.utc)
+            if dt >= cutoff_7d:
+                active_7d += 1
+
+        leaderboard_raw.append({
+            "rank":          0,   # filled after sort
+            "displayName":   anon_map.get(uid, "User ???"),
+            "level":         lvl,
+            "totalPoints":   pts,
+            "currentStreak": str_,
+            "badges":        len(d.get("badges", [])),
+        })
+
+    # Sort leaderboard by points desc, assign rank
+    leaderboard_raw.sort(key=lambda r: r["totalPoints"], reverse=True)
+    for i, entry in enumerate(leaderboard_raw):
+        entry["rank"] = i + 1
+
+    n = len(gam_docs)
+
+    # ── Active challenges for this company ────────────────────────────────
+    active_challenges = []
+    try:
+        for doc in db.collection("challenges").stream():
+            d = doc.to_dict()
+            if not d.get("is_active", False):
+                continue
+            cid = d.get("company_id")
+            if cid is not None and cid != company_id:
+                continue   # skip challenges scoped to other companies
+            active_challenges.append({
+                "id":           doc.id,
+                "title":        d.get("title"),
+                "description":  d.get("description"),
+                "type":         d.get("type"),
+                "target":       d.get("target"),
+                "pointsReward": d.get("points_reward"),
+                "endsAt":       d.get("ends_at"),
+            })
+    except Exception as e:
+        print(f"[employer_gamification] challenges error: {e}")
+
+    return {
+        "companyId":         company_id,
+        "totalPlayers":      n,
+        "activePlayers7d":   active_7d,
+        "avgPoints":         round(total_pts / n, 1),
+        "avgLevel":          round(total_lvl / n, 2),
+        "avgStreak":         round(total_streak / n, 2),
+        "badgeDistribution": badge_dist,
+        "leaderboard":       leaderboard_raw[:20],   # top 20 only
+        "activeChallenges":  active_challenges,
+    }

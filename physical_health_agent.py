@@ -8,12 +8,14 @@ LLM pipeline functions for:
 Called by routers/physical_health.py — never called directly by main.py.
 """
 
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
 
 from langchain_openai import ChatOpenAI
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
+from middleware.usage_tracker import track_usage, tokens_from_langchain_raw
 
 from physical_health_schemas import (
     MedicalReportAnalysis,
@@ -52,20 +54,40 @@ class _PeriodicReportLLMOutput(BaseModel):
 
 # ─── Medical document analysis ───────────────────────────────────────────────
 
-def analyze_medical_document(raw_text: str) -> MedicalReportAnalysis:
+def analyze_medical_document(
+    raw_text: str,
+    user_id: str = "",
+    company_id: str = "",
+    db=None,
+) -> MedicalReportAnalysis:
     """
     Node 1: LLM reads raw medical report text and returns structured findings.
     Uses structured output — returns MedicalReportAnalysis directly.
     """
     llm = _get_llm(temperature=0.1)
-    structured = llm.with_structured_output(MedicalReportAnalysis)
-    result = (ANALYZE_MEDICAL_REPORT | structured).invoke({"report_text": raw_text})
-    return result
+    structured = llm.with_structured_output(MedicalReportAnalysis, include_raw=True)
+    t0  = time.time()
+    raw = (ANALYZE_MEDICAL_REPORT | structured).invoke({"report_text": raw_text})
+    _tin, _tout = tokens_from_langchain_raw(raw["raw"])
+    track_usage(
+        user_id    = user_id,
+        company_id = company_id,
+        feature    = "physical_health",
+        model      = "gpt-4o-mini",
+        tokens_in  = _tin,
+        tokens_out = _tout,
+        db         = db,
+        latency_ms = int((time.time() - t0) * 1000),
+    )
+    return raw["parsed"]
 
 
 def generate_health_suggestions(
     analysis: MedicalReportAnalysis,
     checkin_context: str,
+    user_id: str = "",
+    company_id: str = "",
+    db=None,
 ) -> List[str]:
     """
     Node 2: LLM generates personalised lifestyle suggestions combining
@@ -86,11 +108,23 @@ def generate_health_suggestions(
 
     findings_summary = f"{analysis.summary}\n\n{flagged_summary}"
 
+    t0 = time.time()
     response = llm.invoke(
         GENERATE_HEALTH_SUGGESTIONS.format_messages(
             findings_summary=findings_summary,
             checkin_context=checkin_context or "No recent check-in data available.",
         )
+    )
+    _meta = getattr(response, "usage_metadata", None) or {}
+    track_usage(
+        user_id    = user_id,
+        company_id = company_id,
+        feature    = "physical_health",
+        model      = "gpt-4o-mini",
+        tokens_in  = int(_meta.get("input_tokens", 0)),
+        tokens_out = int(_meta.get("output_tokens", 0)),
+        db         = db,
+        latency_ms = int((time.time() - t0) * 1000),
     )
     raw = response.content.strip()
 
@@ -140,7 +174,7 @@ async def process_medical_document(
         doc_ref.update({"status": "processing"})
 
         # Step 2 — LLM analysis
-        analysis = analyze_medical_document(raw_text)
+        analysis = analyze_medical_document(raw_text, user_id=user_id, company_id=company_id, db=db)
 
         # Step 3 — RAG ingestion (filtered by user_id so Q&A stays private)
         chunk_ids: List[str] = []
@@ -165,7 +199,7 @@ async def process_medical_document(
         checkin_context = _build_checkin_context(user_id, db)
 
         # Step 5 — personalised suggestions
-        suggestions = generate_health_suggestions(analysis, checkin_context)
+        suggestions = generate_health_suggestions(analysis, checkin_context, user_id=user_id, company_id=company_id, db=db)
 
         # Step 6 — update Firestore with all results
         doc_ref.update({
@@ -263,12 +297,25 @@ def generate_periodic_report(
 
     # LLM structured generation
     llm = _get_llm(temperature=0.2)
-    structured = llm.with_structured_output(_PeriodicReportLLMOutput)
-    llm_result = (GENERATE_PERIODIC_REPORT | structured).invoke({
+    structured = llm.with_structured_output(_PeriodicReportLLMOutput, include_raw=True)
+    _t0  = time.time()
+    _raw = (GENERATE_PERIODIC_REPORT | structured).invoke({
         "period":          period_str,
         "metrics_summary": metrics_summary,
         "medical_context": medical_context,
     })
+    llm_result = _raw["parsed"]
+    _tin, _tout = tokens_from_langchain_raw(_raw["raw"])
+    track_usage(
+        user_id    = user_id,
+        company_id = company_id,
+        feature    = "physical_health",
+        model      = "gpt-4o-mini",
+        tokens_in  = _tin,
+        tokens_out = _tout,
+        db         = db,
+        latency_ms = int((time.time() - _t0) * 1000),
+    )
 
     report_id = str(uuid.uuid4())
     generated_at = datetime.now(timezone.utc)

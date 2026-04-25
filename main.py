@@ -23,8 +23,9 @@ load_dotenv()
 from typing import Annotated, List, TypedDict, Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
@@ -56,6 +57,13 @@ from routers.employer import router as employer_crud_router
 from routers.super_admin import router as super_admin_router
 from routers.employee_import import router as employee_import_router
 from routers.physical_health import router as physical_health_router
+from routers.admin_metrics import router as admin_metrics_router
+from middleware.activity_tracker import persist_chat_session
+from firebase_config import get_db
+from firebase_admin import auth as _fb_auth
+
+# Optional bearer for /chat — does not reject unauthenticated requests
+_optional_bearer = HTTPBearer(auto_error=False)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # STATE
@@ -438,12 +446,31 @@ app.include_router(employer_crud_router, prefix="/api")
 app.include_router(super_admin_router, prefix="/api")
 app.include_router(employee_import_router, prefix="/api")
 app.include_router(physical_health_router, prefix="/api")
+app.include_router(admin_metrics_router, prefix="/api")
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(
+    req: ChatRequest,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
+):
     if not os.environ.get("OPENAI_API_KEY"):
         raise HTTPException(500, "OPENAI_API_KEY not configured.")
+
+    # ── Resolve caller identity (optional auth) ──────────────────────────────
+    uid        = "anonymous"
+    company_id = ""
+    if credentials:
+        try:
+            decoded = _fb_auth.verify_id_token(credentials.credentials, check_revoked=True)
+            uid = decoded.get("uid", "anonymous")
+            db  = get_db()
+            if db and uid != "anonymous":
+                user_doc = db.collection("users").document(uid).get()
+                if user_doc.exists:
+                    company_id = user_doc.to_dict().get("company_id", "") or ""
+        except Exception:
+            pass  # Non-fatal — fall through as anonymous
 
     sid, session = _get_or_create_session(req.session_id)
     session["messages"].append(HumanMessage(content=req.message))
@@ -475,6 +502,17 @@ async def chat(req: ChatRequest):
 
     prev_mem_count = len(session.get("memories", [])) - len(result.get("new_memories", []))
     fresh = result.get("new_memories", [])[prev_mem_count:] if prev_mem_count >= 0 else []
+
+    # ── Persist session to Firestore (non-blocking) ──────────────────────────
+    db = get_db()
+    if db:
+        asyncio.create_task(persist_chat_session(
+            session_id    = sid,
+            user_id       = uid,
+            company_id    = company_id,
+            message_count = len(session["messages"]),
+            db            = db,
+        ))
 
     return ChatResponse(
         session_id=sid,

@@ -17,6 +17,7 @@ from firebase_admin import auth as fb_auth
 from firebase_config import get_db, firebaseConfig
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 from datetime import datetime, timezone
+from middleware.activity_tracker import update_last_active
 
 security = HTTPBearer()
 
@@ -28,6 +29,9 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
     token = credentials.credentials
     try:
         decoded_token = fb_auth.verify_id_token(token, check_revoked=True)
+        uid = decoded_token.get("uid")
+        if uid:
+            update_last_active(uid)   # fire-and-forget, never blocks auth
         return decoded_token
     except fb_auth.RevokedIdTokenError:
         raise HTTPException(
