@@ -50,6 +50,7 @@ from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 from pydantic import BaseModel, EmailStr
 
 from routers.auth import get_super_admin_user, RegisterRequest, RegisterResponse
+from utils.audit import log_audit
 
 router = APIRouter(prefix="/admin", tags=["Super Admin"])
 
@@ -326,21 +327,21 @@ async def get_employer(uid: str, _: dict = Depends(get_super_admin_user)):
 async def update_employer(
     uid: str,
     req: UpdateUserRequest,
-    _: dict = Depends(get_super_admin_user),
+    admin: dict = Depends(get_super_admin_user),
 ):
-    return await _update_user(uid, req, expected_role="employer")
+    return await _update_user(uid, req, expected_role="employer", actor=admin)
 
 
 # ─── Employers: Deactivate / Reactivate ───────────────────────────────────────
 
 @router.post("/employers/{uid}/deactivate", response_model=MutationResponse, summary="Deactivate Employer")
-async def deactivate_employer(uid: str, _: dict = Depends(get_super_admin_user)):
-    return await _set_user_active(uid, active=False, role_check="employer")
+async def deactivate_employer(uid: str, admin: dict = Depends(get_super_admin_user)):
+    return await _set_user_active(uid, active=False, role_check="employer", actor=admin)
 
 
 @router.post("/employers/{uid}/reactivate", response_model=MutationResponse, summary="Reactivate Employer")
-async def reactivate_employer(uid: str, _: dict = Depends(get_super_admin_user)):
-    return await _set_user_active(uid, active=True, role_check="employer")
+async def reactivate_employer(uid: str, admin: dict = Depends(get_super_admin_user)):
+    return await _set_user_active(uid, active=True, role_check="employer", actor=admin)
 
 
 # ─── Employers: Hard Delete ───────────────────────────────────────────────────
@@ -354,7 +355,7 @@ async def reactivate_employer(uid: str, _: dict = Depends(get_super_admin_user))
         "and Firebase Auth account. Employees are NOT deleted — their company_id is preserved."
     ),
 )
-async def delete_employer(uid: str, _: dict = Depends(get_super_admin_user)):
+async def delete_employer(uid: str, admin: dict = Depends(get_super_admin_user)):
     db = get_db()
     if not db:
         raise HTTPException(503, "Database unavailable")
@@ -387,6 +388,17 @@ async def delete_employer(uid: str, _: dict = Depends(get_super_admin_user)):
         fb_auth.delete_user(uid)
     except Exception as e:
         errors.append(f"firebase_auth: {e}")
+
+    log_audit(
+        actor_uid=admin.get("id", ""),
+        actor_role="super_admin",
+        action="employer.delete",
+        company_id=company_id or "",
+        db=db,
+        target_uid=uid,
+        target_type="employer",
+        metadata={"errors": errors} if errors else {},
+    )
 
     return MutationResponse(
         success=not errors,
@@ -485,9 +497,9 @@ async def admin_get_employee(uid: str, _: dict = Depends(get_super_admin_user)):
 async def admin_update_employee(
     uid: str,
     req: UpdateUserRequest,
-    _: dict = Depends(get_super_admin_user),
+    admin: dict = Depends(get_super_admin_user),
 ):
-    return await _update_user(uid, req, expected_role=None)
+    return await _update_user(uid, req, expected_role=None, actor=admin)
 
 
 # ─── Employees: Hard Delete ───────────────────────────────────────────────────
@@ -497,7 +509,7 @@ async def admin_update_employee(
     response_model=MutationResponse,
     summary="Hard-Delete Employee",
 )
-async def admin_delete_employee(uid: str, _: dict = Depends(get_super_admin_user)):
+async def admin_delete_employee(uid: str, admin: dict = Depends(get_super_admin_user)):
     db = get_db()
     if not db:
         raise HTTPException(503, "Database unavailable")
@@ -556,6 +568,17 @@ async def admin_delete_employee(uid: str, _: dict = Depends(get_super_admin_user
         fb_auth.delete_user(uid)
     except Exception as e:
         errors.append(f"firebase_auth: {e}")
+
+    log_audit(
+        actor_uid=admin.get("id", ""),
+        actor_role="super_admin",
+        action="user.delete",
+        company_id=d.get("company_id", ""),
+        db=db,
+        target_uid=uid,
+        target_type="user",
+        metadata={"errors": errors} if errors else {},
+    )
 
     return MutationResponse(
         success=not errors,
@@ -649,7 +672,7 @@ async def admin_get_company(company_id: str, _: dict = Depends(get_super_admin_u
 async def admin_update_company(
     company_id: str,
     req: UpdateCompanyRequest,
-    _: dict = Depends(get_super_admin_user),
+    admin: dict = Depends(get_super_admin_user),
 ):
     db = get_db()
     if not db:
@@ -695,6 +718,17 @@ async def admin_update_company(
         except Exception as e:
             print(f"[admin] company name sync error: {e}")
 
+    log_audit(
+        actor_uid=admin.get("id", ""),
+        actor_role="super_admin",
+        action="company.update",
+        company_id=company_id,
+        db=db,
+        target_uid=None,
+        target_type="company",
+        metadata={"updated_fields": updated_fields},
+    )
+
     return MutationResponse(
         success=True,
         message="Company updated successfully.",
@@ -716,7 +750,7 @@ async def admin_update_company(
 async def admin_reset_password(
     uid: str,
     req: ResetPasswordRequest,
-    _: dict = Depends(get_super_admin_user),
+    admin: dict = Depends(get_super_admin_user),
 ):
     if len(req.new_password) < 8:
         raise HTTPException(400, "New password must be at least 8 characters.")
@@ -725,6 +759,17 @@ async def admin_reset_password(
         fb_auth.update_user(uid, password=req.new_password)
     except Exception as e:
         raise HTTPException(500, f"Password reset failed: {e}")
+
+    db = get_db()
+    log_audit(
+        actor_uid=admin.get("id", ""),
+        actor_role="super_admin",
+        action="user.password_reset",
+        company_id="",
+        db=db,
+        target_uid=uid,
+        target_type="user",
+    )
 
     return MutationResponse(
         success=True,
@@ -784,6 +829,7 @@ async def _update_user(
     uid: str,
     req: UpdateUserRequest,
     expected_role: Optional[str],
+    actor: Optional[dict] = None,
 ) -> MutationResponse:
     db = get_db()
     if not db:
@@ -842,6 +888,19 @@ async def _update_user(
             print(f"[admin] is_active sync error: {e}")
 
     db.collection("users").document(uid).update(updates)
+
+    if actor:
+        log_audit(
+            actor_uid=actor.get("id", ""),
+            actor_role="super_admin",
+            action="user.update",
+            company_id=d.get("company_id", ""),
+            db=db,
+            target_uid=uid,
+            target_type="employer" if d.get("role") == "employer" else "user",
+            metadata={"updated_fields": updated_fields},
+        )
+
     return MutationResponse(
         success=True,
         message="User updated successfully.",
@@ -849,7 +908,7 @@ async def _update_user(
     )
 
 
-async def _set_user_active(uid: str, active: bool, role_check: str) -> MutationResponse:
+async def _set_user_active(uid: str, active: bool, role_check: str, actor: Optional[dict] = None) -> MutationResponse:
     db = get_db()
     if not db:
         raise HTTPException(503, "Database unavailable")
@@ -874,6 +933,18 @@ async def _set_user_active(uid: str, active: bool, role_check: str) -> MutationR
         "is_active":  active,
         "updated_at": SERVER_TIMESTAMP,
     })
+
+    if actor:
+        audit_action = f"employer.{'reactivate' if active else 'deactivate'}"
+        log_audit(
+            actor_uid=actor.get("id", ""),
+            actor_role="super_admin",
+            action=audit_action,
+            company_id=d.get("company_id", ""),
+            db=db,
+            target_uid=uid,
+            target_type="employer",
+        )
 
     action = "reactivated" if active else "deactivated"
     return MutationResponse(success=True, message=f"User {action} successfully.")

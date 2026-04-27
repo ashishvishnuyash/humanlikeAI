@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from datetime import datetime
 from typing import List
 from fastapi import APIRouter, HTTPException, Depends
@@ -7,6 +8,7 @@ from pydantic import BaseModel
 from openai import OpenAI
 from firebase_config import get_db
 from routers.auth import get_current_user
+from middleware.usage_tracker import track_usage, tokens_from_openai_completion
 
 router = APIRouter(prefix="/recommendations", tags=["Recommendations"], dependencies=[Depends(get_current_user)])
 
@@ -295,6 +297,7 @@ Guidelines:
 - Ensure duration matches their available time
 - Include variety in recommendation types"""
 
+        _t0 = time.time()
         completion = openai_client.chat.completions.create(
             model="gpt-4",
             messages=[
@@ -304,7 +307,19 @@ Guidelines:
             temperature=0.7,
             max_tokens=2000,
         )
-        
+        _latency = int((time.time() - _t0) * 1000)
+        _tin, _tout = tokens_from_openai_completion(completion)
+        track_usage(
+            user_id    = req.employee_id,
+            company_id = req.company_id,
+            feature    = "recommendation",
+            model      = "gpt-4",
+            tokens_in  = _tin,
+            tokens_out = _tout,
+            db         = get_db(),
+            latency_ms = _latency,
+        )
+
         response_text = completion.choices[0].message.content
         try:
             recommendations = json.loads(response_text)

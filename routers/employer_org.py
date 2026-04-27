@@ -163,9 +163,25 @@ class InterventionCohort(BaseModel):
 class ProgramEffectivenessResponse(BaseModel):
     company_id: str
     cohorts: List[InterventionCohort]
-    overall_lift: Optional[float]
+    overall_lift: float
     recommendation: str
     computed_at: str
+
+
+class LogInterventionRequest(BaseModel):
+    company_id: str
+    label: str = Field(..., min_length=1, max_length=120)
+    start_date: datetime
+    end_date: datetime
+
+
+class LogInterventionResponse(BaseModel):
+    id: str
+    company_id: str
+    label: str
+    start_date: str
+    end_date: str
+    created_at: str
 
 
 # ─── Endpoints ───────────────────────────────────────────────────────────────
@@ -587,6 +603,53 @@ async def get_roi_impact(
     )
 
 
+@router.post(
+    "/program-effectiveness/log",
+    response_model=LogInterventionResponse,
+    summary="Log a Wellbeing Intervention",
+    description="Record a program (start/end dates + label) so before/after lift can be computed.",
+)
+async def log_intervention(
+    req: LogInterventionRequest,
+    user_token: dict = Depends(get_current_user),
+):
+    profile = _require_employer(user_token)
+    if profile.get("company_id") != req.company_id:
+        raise HTTPException(403, "Access denied for this company")
+
+    if req.end_date <= req.start_date:
+        raise HTTPException(422, "end_date must be after start_date")
+
+    db = get_db()
+    if not db:
+        raise HTTPException(503, "Database unavailable")
+
+    now = utc_now()
+    doc = {
+        "company_id": req.company_id,
+        "label":      req.label,
+        "start_date": req.start_date.isoformat(),
+        "end_date":   req.end_date.isoformat(),
+        "created_at": now.isoformat(),
+        "created_by": profile.get("id") or profile.get("uid", ""),
+    }
+
+    try:
+        ref = db.collection("interventions").document()
+        ref.set(doc)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to save intervention: {e}")
+
+    return LogInterventionResponse(
+        id=ref.id,
+        company_id=req.company_id,
+        label=req.label,
+        start_date=req.start_date.isoformat(),
+        end_date=req.end_date.isoformat(),
+        created_at=now.isoformat(),
+    )
+
+
 @router.get(
     "/program-effectiveness",
     response_model=ProgramEffectivenessResponse,
@@ -611,8 +674,17 @@ async def get_program_effectiveness(
 
     interventions = _intervention_records(company_id, db)
 
+    def _wi(cis: list) -> float:
+        ms  = [c.get("mood_score", 5)  for c in cis if "mood_score"  in c]
+        ss  = [c.get("stress_level", 5) for c in cis if "stress_level" in c]
+        n   = len({c.get("user_id") for c in cis})
+        am  = sum(ms) / len(ms) if ms else 5.0
+        as_ = sum(ss) / len(ss) if ss else 5.0
+        part = min(100.0, n / team_size * 100)
+        return round((am / 10 * 100 * 0.35) + ((10 - as_) / 10 * 100 * 0.40) + (part * 0.25), 1)
+
     cohorts: List[InterventionCohort] = []
-    lifts = []
+    lifts: List[float] = []
 
     for intv in interventions:
         start_ts = _ts_to_dt(intv.get("start_date"))
@@ -622,13 +694,11 @@ async def get_program_effectiveness(
 
         window    = (end_ts - start_ts).days
         before_ci = _fetch_company_check_ins(company_id, db, days=window * 2)
-        # before: window days before start
         before_ci = [
             c for c in before_ci
             if start_ts - timedelta(days=window) <=
                (_ts_to_dt(c.get("created_at")) or start_ts) < start_ts
         ]
-        # after: window days after start
         after_ci = _fetch_company_check_ins(company_id, db, days=window)
 
         if len(before_ci) < K_ANON_THRESHOLD or len(after_ci) < K_ANON_THRESHOLD:
@@ -641,15 +711,6 @@ async def get_program_effectiveness(
                 suppressed=True,
             ))
             continue
-
-        def _wi(cis):
-            ms = [c.get("mood_score", 5) for c in cis if "mood_score" in c]
-            ss = [c.get("stress_level", 5) for c in cis if "stress_level" in c]
-            n  = len({c.get("user_id") for c in cis})
-            am = sum(ms)/len(ms) if ms else 5.0
-            as_ = sum(ss)/len(ss) if ss else 5.0
-            part = min(100.0, n / team_size * 100)
-            return round((am/10*100*0.35) + ((10-as_)/10*100*0.40) + (part*0.25), 1)
 
         before_wi = _wi(before_ci)
         after_wi  = _wi(after_ci)
@@ -664,12 +725,35 @@ async def get_program_effectiveness(
             size_band=_size_band(len({c.get("user_id") for c in after_ci})),
         ))
 
-    overall_lift = round(sum(lifts) / len(lifts), 1) if lifts else None
+    # ── Fallback: derive lift from check-in history when no interventions logged ──
+    if not cohorts:
+        all_ci = _fetch_company_check_ins(company_id, db, days=90)
+        dated  = sorted(
+            [c for c in all_ci if _ts_to_dt(c.get("created_at"))],
+            key=lambda c: _ts_to_dt(c["created_at"]),
+        )
+        mid = len(dated) // 2
+        if mid >= K_ANON_THRESHOLD and (len(dated) - mid) >= K_ANON_THRESHOLD:
+            before_ci = dated[:mid]
+            after_ci  = dated[mid:]
+            before_wi = _wi(before_ci)
+            after_wi  = _wi(after_ci)
+            delta     = round(after_wi - before_wi, 1)
+            lifts.append(delta)
+            cohorts.append(InterventionCohort(
+                label="Baseline vs Current (derived)",
+                before_index=before_wi,
+                after_index=after_wi,
+                delta=delta,
+                size_band=_size_band(len({c.get("user_id") for c in after_ci})),
+            ))
+
+    overall_lift = round(sum(lifts) / len(lifts), 1) if lifts else 0.0
 
     if not cohorts:
         recommendation = (
-            "No intervention records found. Log programs in the 'interventions' collection "
-            "to enable before/after effectiveness analysis."
+            "Not enough check-in data yet. Use POST /program-effectiveness/log to record "
+            "a program, or wait for more employee check-ins to accumulate."
         )
     elif overall_lift is not None and overall_lift >= 3:
         recommendation = "Interventions show positive impact. Continue and scale successful programs."

@@ -24,6 +24,7 @@ from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 from pydantic import BaseModel, EmailStr
 
 from routers.auth import get_current_user, get_employer_user
+from utils.audit import log_audit
 
 # Firestore atomic increment helper
 _firestore_increment = admin_firestore.firestore.Increment
@@ -281,6 +282,17 @@ async def create_employee(
         print(f"[users] create_employee Firestore error: {e}")
         raise HTTPException(500, "Failed to save employee profile. Account creation rolled back.")
 
+    log_audit(
+        actor_uid=employer.get("id", ""),
+        actor_role=employer.get("role", "employer"),
+        action="user.create",
+        company_id=employer_company_id,
+        db=db,
+        target_uid=uid,
+        target_type="user",
+        metadata={"role": req.role, "email": req.email, "department": req.department},
+    )
+
     return CreateEmployeeResponse(
         success=True,
         uid=uid,
@@ -478,6 +490,17 @@ async def update_employee(
 
     db.collection("users").document(uid).update(updates)
 
+    log_audit(
+        actor_uid=employer.get("id", ""),
+        actor_role=employer.get("role", "employer"),
+        action="user.update",
+        company_id=company_id,
+        db=db,
+        target_uid=uid,
+        target_type="user",
+        metadata={"updated_fields": updated_fields},
+    )
+
     return UpdateEmployeeResponse(
         success=True,
         uid=uid,
@@ -543,6 +566,17 @@ async def _set_employee_active(uid: str, active: bool, employer: dict) -> Deacti
         "is_active":  active,
         "updated_at": SERVER_TIMESTAMP,
     })
+
+    audit_action = "user.reactivate" if active else "user.deactivate"
+    log_audit(
+        actor_uid=employer.get("id", ""),
+        actor_role=employer.get("role", "employer"),
+        action=audit_action,
+        company_id=company_id,
+        db=db,
+        target_uid=uid,
+        target_type="user",
+    )
 
     action = "reactivated" if active else "deactivated"
     return DeactivateResponse(
@@ -640,6 +674,17 @@ async def delete_employee(
 
     if errors:
         print(f"[users] delete_employee partial errors for {uid}: {errors}")
+
+    log_audit(
+        actor_uid=employer.get("id", ""),
+        actor_role=employer.get("role", "employer"),
+        action="user.delete",
+        company_id=company_id,
+        db=db,
+        target_uid=uid,
+        target_type="user",
+        metadata={"errors": errors} if errors else {},
+    )
 
     return DeleteEmployeeResponse(
         success=True,
