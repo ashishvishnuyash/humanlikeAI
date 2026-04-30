@@ -53,6 +53,7 @@ from auth.password import hash_password, verify_password
 from db.models import Company, User
 from db.session import get_session
 from routers.auth import get_super_admin_user, RegisterRequest, RegisterResponse
+from utils.audit import log_audit
 
 router = APIRouter(prefix="/admin", tags=["Super Admin"])
 
@@ -341,19 +342,39 @@ async def update_employer(
 @router.post("/employers/{uid}/deactivate", response_model=MutationResponse, summary="Deactivate Employer")
 async def deactivate_employer(
     uid: str,
-    _: dict = Depends(get_super_admin_user),
+    admin: dict = Depends(get_super_admin_user),
     db: Session = Depends(get_session),
 ):
-    return await _set_user_active(uid, active=False, role_check="employer", db=db)
+    result = await _set_user_active(uid, active=False, role_check="employer", db=db)
+    target = db.query(User).filter(User.id == uid).one_or_none()
+    log_audit(
+        actor_uid=admin.get("id", ""),
+        actor_role="super_admin",
+        action="employer.deactivate",
+        company_id=str(target.company_id) if target and target.company_id else "",
+        target_uid=uid,
+        target_type="employer",
+    )
+    return result
 
 
 @router.post("/employers/{uid}/reactivate", response_model=MutationResponse, summary="Reactivate Employer")
 async def reactivate_employer(
     uid: str,
-    _: dict = Depends(get_super_admin_user),
+    admin: dict = Depends(get_super_admin_user),
     db: Session = Depends(get_session),
 ):
-    return await _set_user_active(uid, active=True, role_check="employer", db=db)
+    result = await _set_user_active(uid, active=True, role_check="employer", db=db)
+    target = db.query(User).filter(User.id == uid).one_or_none()
+    log_audit(
+        actor_uid=admin.get("id", ""),
+        actor_role="super_admin",
+        action="employer.reactivate",
+        company_id=str(target.company_id) if target and target.company_id else "",
+        target_uid=uid,
+        target_type="employer",
+    )
+    return result
 
 
 # ─── Employers: Hard Delete ───────────────────────────────────────────────────
@@ -369,7 +390,7 @@ async def reactivate_employer(
 )
 async def delete_employer(
     uid: str,
-    _: dict = Depends(get_super_admin_user),
+    admin: dict = Depends(get_super_admin_user),
     db: Session = Depends(get_session),
 ):
     user = db.query(User).filter(User.id == uid).one_or_none()
@@ -388,6 +409,15 @@ async def delete_employer(
         db.query(Company).filter(Company.id == company_id).delete()
 
     db.commit()
+
+    log_audit(
+        actor_uid=admin.get("id", ""),
+        actor_role="super_admin",
+        action="employer.delete",
+        company_id=str(company_id) if company_id is not None else "",
+        target_uid=uid,
+        target_type="employer",
+    )
 
     return MutationResponse(success=True, message="Employer deleted.")
 
@@ -502,7 +532,7 @@ async def admin_update_employee(
 )
 async def admin_delete_employee(
     uid: str,
-    _: dict = Depends(get_super_admin_user),
+    admin: dict = Depends(get_super_admin_user),
     db: Session = Depends(get_session),
 ):
     user = db.query(User).filter(User.id == uid).one_or_none()
@@ -513,6 +543,7 @@ async def admin_delete_employee(
         raise HTTPException(400, "Use the employer delete endpoint for employer accounts.")
 
     company_id = user.company_id
+    target_role = user.role
 
     # Delete user row. FK ON DELETE SET NULL handles manager_id references from
     # direct reports automatically at the DB level.
@@ -525,6 +556,16 @@ async def admin_delete_employee(
             company.employee_count -= 1
 
     db.commit()
+
+    log_audit(
+        actor_uid=admin.get("id", ""),
+        actor_role="super_admin",
+        action="user.delete",
+        company_id=str(company_id) if company_id is not None else "",
+        target_uid=uid,
+        target_type="user",
+        metadata={"role": target_role},
+    )
 
     return MutationResponse(success=True, message="Employee deleted.")
 

@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from db.models import CheckIn, Intervention, MHSession, User
 from db.session import get_session
 from routers.auth import get_current_user
+from utils.audit import log_audit
 
 # Import pure-Python utility helpers from employer_dashboard (no Firestore calls).
 from routers.employer_dashboard import (
@@ -324,6 +325,22 @@ class ProgramEffectivenessResponse(BaseModel):
     overall_lift: Optional[float]
     recommendation: str
     computed_at: str
+
+
+class LogInterventionRequest(BaseModel):
+    company_id: str
+    label: str = Field(..., min_length=1, max_length=120)
+    start_date: datetime
+    end_date: datetime
+
+
+class LogInterventionResponse(BaseModel):
+    id: str
+    company_id: str
+    label: str
+    start_date: str
+    end_date: str
+    created_at: str
 
 
 # ─── Endpoints ───────────────────────────────────────────────────────────────
@@ -732,6 +749,74 @@ async def get_roi_impact(
         ),
         data_quality=quality,
         computed_at=utc_now().isoformat(),
+    )
+
+
+@router.post(
+    "/program-effectiveness/log",
+    response_model=LogInterventionResponse,
+    summary="Log a Wellbeing Intervention",
+    description="Record a program (start/end dates + label) so before/after lift can be computed.",
+)
+async def log_intervention(
+    req: LogInterventionRequest,
+    user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
+):
+    profile = _require_employer_sa(user_token, db)
+    if profile.get("company_id") != req.company_id:
+        raise HTTPException(403, "Access denied for this company")
+
+    if req.end_date <= req.start_date:
+        raise HTTPException(422, "end_date must be after start_date")
+
+    cid = _parse_company_uuid(req.company_id)
+    now = utc_now()
+
+    actor_uid = profile.get("id") or profile.get("uid", "")
+
+    intv_id = uuid.uuid4()
+    intervention = Intervention(
+        id=intv_id,
+        company_id=cid,
+        user_id=None,
+        data={
+            "label":      req.label,
+            "start_date": req.start_date.isoformat(),
+            "end_date":   req.end_date.isoformat(),
+            "created_by": actor_uid,
+        },
+        status="logged",
+    )
+
+    try:
+        db.add(intervention)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Failed to save intervention: {e}")
+
+    log_audit(
+        actor_uid=actor_uid,
+        actor_role=profile.get("role", "employer"),
+        action="intervention.log",
+        company_id=req.company_id,
+        target_uid=str(intv_id),
+        target_type="intervention",
+        metadata={
+            "label":      req.label,
+            "start_date": req.start_date.isoformat(),
+            "end_date":   req.end_date.isoformat(),
+        },
+    )
+
+    return LogInterventionResponse(
+        id=str(intv_id),
+        company_id=req.company_id,
+        label=req.label,
+        start_date=req.start_date.isoformat(),
+        end_date=req.end_date.isoformat(),
+        created_at=now.isoformat(),
     )
 
 
