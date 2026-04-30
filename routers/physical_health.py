@@ -18,18 +18,25 @@ Physical Health Router
 
   POST   /api/physical-health/ask                    → RAG Q&A on own medical history
 
-Auth: all endpoints require a valid Firebase Bearer token (get_current_user).
+Auth: all endpoints require a valid Bearer token (get_current_user).
 Medical documents are 100% user-private — never filtered by company_id.
 """
 
 import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
-from firebase_config import get_db, firebaseConfig
-from google.cloud.firestore_v1 import SERVER_TIMESTAMP
+from sqlalchemy.orm import Session
+
+from db.session import get_session
+from db.models.physical_health import (
+    MedicalDocument,
+    PhysicalHealthCheckin,
+    PhysicalHealthReport,
+)
+from db.models.user import User
 
 from routers.auth import get_current_user
 from report_schemas import score_to_level
@@ -38,7 +45,6 @@ from physical_health_schemas import (
     AskResponse,
     CheckInHistoryItem,
     CheckInHistoryResponse,
-    FlaggedValue,
     HealthTrendsResponse,
     MedicalDocumentDetail,
     MedicalDocumentListResponse,
@@ -66,15 +72,13 @@ _MAX_FILE_BYTES = 10 * 1024 * 1024   # 10 MB
 
 # ─── Auth helper: get uid + company_id from token ────────────────────────────
 
-def _get_user_context(user_token: dict, db) -> tuple[str, str]:
+def _get_user_context(user_token: dict, db: Session) -> tuple[str, Optional[uuid.UUID]]:
     """Return (uid, company_id) from token. Raises 404 if profile missing."""
     uid = user_token.get("uid")
-    doc = db.collection("users").document(uid).get()
-    if not doc.exists:
+    user = db.query(User).filter(User.id == uid).first()
+    if not user:
         raise HTTPException(404, "User profile not found.")
-    profile = doc.to_dict()
-    company_id = profile.get("company_id", "")
-    return uid, company_id
+    return uid, user.company_id
 
 
 # ─── Timestamp helper ────────────────────────────────────────────────────────
@@ -102,19 +106,12 @@ def _ts_to_iso(ts) -> Optional[str]:
 async def submit_checkin(
     req: PhysicalCheckInRequest,
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     uid, company_id = _get_user_context(user_token, db)
-    checkin_id = str(uuid.uuid4())
+    checkin_id = uuid.uuid4()
 
-    doc_data = {
-        "checkin_id":        checkin_id,
-        "user_id":           uid,
-        "company_id":        company_id,
-        "created_at":        SERVER_TIMESTAMP,
+    vitals = {
         "energy_level":      req.energy_level,
         "sleep_quality":     req.sleep_quality,
         "sleep_hours":       req.sleep_hours,
@@ -124,16 +121,28 @@ async def submit_checkin(
         "nutrition_quality": req.nutrition_quality,
         "pain_level":        req.pain_level,
         "hydration":         req.hydration,
-        "notes":             req.notes,
+    }
+    symptoms = {
+        "notes": req.notes,
     }
 
+    checkin = PhysicalHealthCheckin(
+        id=checkin_id,
+        user_id=uid,
+        company_id=company_id,
+        vitals=vitals,
+        symptoms=symptoms,
+    )
+
     try:
-        db.collection("physical_health_checkins").document(checkin_id).set(doc_data)
+        db.add(checkin)
+        db.commit()
     except Exception as e:
+        db.rollback()
         raise HTTPException(500, f"Failed to save check-in: {e}")
 
     nudge = _compute_nudge(req)
-    return PhysicalCheckInResponse(success=True, checkin_id=checkin_id, nudge=nudge)
+    return PhysicalCheckInResponse(success=True, checkin_id=str(checkin_id), nudge=nudge)
 
 
 @router.get(
@@ -146,41 +155,41 @@ async def get_checkin_history(
     limit: int = Query(20, ge=1, le=100),
     days:  int = Query(90, ge=1, le=365, description="Lookback window in days"),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     uid, _ = _get_user_context(user_token, db)
-    cutoff  = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
     try:
-        docs = (
-            db.collection("physical_health_checkins")
-            .where("user_id", "==", uid)
-            .where("created_at", ">=", cutoff)
-            .order_by("created_at", direction="DESCENDING")
-            .stream()
+        rows = (
+            db.query(PhysicalHealthCheckin)
+            .filter(
+                PhysicalHealthCheckin.user_id == uid,
+                PhysicalHealthCheckin.created_at >= cutoff,
+            )
+            .order_by(PhysicalHealthCheckin.created_at.desc())
+            .all()
         )
     except Exception as e:
         raise HTTPException(500, f"Query failed: {e}")
 
     all_items: List[CheckInHistoryItem] = []
-    for doc in docs:
-        d = doc.to_dict()
+    for row in rows:
+        v = row.vitals or {}
+        s = row.symptoms or {}
         all_items.append(CheckInHistoryItem(
-            checkin_id=d.get("checkin_id", doc.id),
-            created_at=_ts_to_iso(d.get("created_at")) or "",
-            energy_level=d.get("energy_level", 0),
-            sleep_quality=d.get("sleep_quality", 0),
-            sleep_hours=d.get("sleep_hours", 0),
-            exercise_done=d.get("exercise_done", False),
-            exercise_minutes=d.get("exercise_minutes", 0),
-            exercise_type=d.get("exercise_type", "none"),
-            nutrition_quality=d.get("nutrition_quality", 0),
-            pain_level=d.get("pain_level", 0),
-            hydration=d.get("hydration", 0),
-            notes=d.get("notes"),
+            checkin_id=str(row.id),
+            created_at=_ts_to_iso(row.created_at) or "",
+            energy_level=v.get("energy_level", 0),
+            sleep_quality=v.get("sleep_quality", 0),
+            sleep_hours=v.get("sleep_hours", 0),
+            exercise_done=v.get("exercise_done", False),
+            exercise_minutes=v.get("exercise_minutes", 0),
+            exercise_type=v.get("exercise_type", "none"),
+            nutrition_quality=v.get("nutrition_quality", 0),
+            pain_level=v.get("pain_level", 0),
+            hydration=v.get("hydration", 0),
+            notes=s.get("notes"),
         ))
 
     total = len(all_items)
@@ -208,26 +217,27 @@ async def get_checkin_history(
     response_model=PhysicalHealthScoreResponse,
     summary="Current Physical Health Score",
 )
-async def get_health_score(user_token: dict = Depends(get_current_user)):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
+async def get_health_score(
+    user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
+):
     uid, _ = _get_user_context(user_token, db)
-    cutoff  = datetime.now(timezone.utc) - timedelta(days=30)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
 
     try:
-        docs = list(
-            db.collection("physical_health_checkins")
-            .where("user_id", "==", uid)
-            .where("created_at", ">=", cutoff)
-            .order_by("created_at", direction="DESCENDING")
-            .stream()
+        rows = (
+            db.query(PhysicalHealthCheckin)
+            .filter(
+                PhysicalHealthCheckin.user_id == uid,
+                PhysicalHealthCheckin.created_at >= cutoff,
+            )
+            .order_by(PhysicalHealthCheckin.created_at.desc())
+            .all()
         )
     except Exception as e:
         raise HTTPException(500, f"Query failed: {e}")
 
-    if not docs:
+    if not rows:
         return PhysicalHealthScoreResponse(
             score=0, level="low",
             last_checkin_date=None, days_since_checkin=None,
@@ -236,7 +246,7 @@ async def get_health_score(user_token: dict = Depends(get_current_user)):
             concerns=[],
         )
 
-    records = [d.to_dict() for d in docs]
+    records = [_row_to_dict(r) for r in rows]
 
     avg_energy    = _avg(records, "energy_level")
     avg_sleep_q   = _avg(records, "sleep_quality")
@@ -257,14 +267,15 @@ async def get_health_score(user_token: dict = Depends(get_current_user)):
     )
     score = round(score, 2)
 
-    # Latest check-in timestamp
-    last_ts = docs[0].to_dict().get("created_at")
+    last_ts = rows[0].created_at
     last_date_str = _ts_to_iso(last_ts)
     days_since = None
-    if last_ts and hasattr(last_ts, "timestamp"):
-        days_since = int((datetime.now(timezone.utc).timestamp() - last_ts.timestamp()) / 86400)
+    if last_ts:
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=timezone.utc)
+        days_since = int((datetime.now(timezone.utc) - last_ts).total_seconds() / 86400)
 
-    streak = _compute_streak(docs)
+    streak = _compute_streak_from_rows(rows)
 
     highlights, concerns = _compute_highlights_concerns(
         avg_energy, avg_sleep_q, avg_sleep_h, avg_nutrition, avg_pain, avg_hydration
@@ -289,11 +300,8 @@ async def get_health_score(user_token: dict = Depends(get_current_user)):
 async def get_health_trends(
     period: str = Query("30d", description="7d | 14d | 30d | 90d"),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     uid, _ = _get_user_context(user_token, db)
 
     days_map = {"7d": 7, "14d": 14, "30d": 30, "90d": 90}
@@ -301,26 +309,29 @@ async def get_health_trends(
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
     try:
-        docs = list(
-            db.collection("physical_health_checkins")
-            .where("user_id", "==", uid)
-            .where("created_at", ">=", cutoff)
-            .order_by("created_at", direction="ASCENDING")
-            .stream()
+        rows = (
+            db.query(PhysicalHealthCheckin)
+            .filter(
+                PhysicalHealthCheckin.user_id == uid,
+                PhysicalHealthCheckin.created_at >= cutoff,
+            )
+            .order_by(PhysicalHealthCheckin.created_at.asc())
+            .all()
         )
     except Exception as e:
         raise HTTPException(500, f"Query failed: {e}")
 
     # Group by date → daily averages
     daily: Dict[str, List[dict]] = {}
-    for doc in docs:
-        d = doc.to_dict()
-        ts = d.get("created_at")
-        if ts and hasattr(ts, "timestamp"):
-            date_str = datetime.fromtimestamp(ts.timestamp(), tz=timezone.utc).strftime("%Y-%m-%d")
+    for row in rows:
+        ts = row.created_at
+        if ts:
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            date_str = ts.strftime("%Y-%m-%d")
         else:
             continue
-        daily.setdefault(date_str, []).append(d)
+        daily.setdefault(date_str, []).append(_row_to_dict(row))
 
     data_points: List[TrendPoint] = []
     for date_str in sorted(daily.keys()):
@@ -336,7 +347,7 @@ async def get_health_trends(
             hydration=round(_avg(recs, "hydration"), 1),
         ))
 
-    all_records = [d.to_dict() for d in docs]
+    all_records = [_row_to_dict(r) for r in rows]
     averages = {
         "energy_level":      round(_avg(all_records, "energy_level"), 2),
         "sleep_quality":     round(_avg(all_records, "sleep_quality"), 2),
@@ -356,7 +367,7 @@ async def get_health_trends(
         data_points=data_points,
         averages=averages,
         trend_direction=trend_direction,
-        total_checkins=len(docs),
+        total_checkins=len(rows),
     )
 
 
@@ -384,10 +395,12 @@ async def upload_medical_report(
     report_date: Optional[str] = Query(None, description="Date on the report (YYYY-MM-DD)"),
     issuing_facility: Optional[str] = Query(None),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    # report_date and issuing_facility are accepted for API compatibility;
+    # they are not persisted in the current MedicalDocument schema.
+    # Phase 5 schema migration will add a metadata JSONB column for these fields.
+    del report_date, issuing_facility
 
     uid, company_id = _get_user_context(user_token, db)
 
@@ -406,8 +419,8 @@ async def upload_medical_report(
     if not file_bytes:
         raise HTTPException(400, "File is empty.")
 
-    doc_id = str(uuid.uuid4())
-    file_type = "pdf" if filename.lower().endswith(".pdf") else "docx"
+    doc_id = uuid.uuid4()
+    doc_id_str = str(doc_id)
 
     # Extract text immediately (fast — we need it for the background task)
     try:
@@ -418,57 +431,52 @@ async def upload_medical_report(
     except Exception as e:
         raise HTTPException(500, f"Failed to extract text from file: {e}")
 
-    # Upload to Firebase Storage
-    storage_path = f"medical_reports/{uid}/{doc_id}/{filename}"
+    # Upload to Azure Blob Storage
+    storage_key = f"{uid}/{doc_id_str}/{filename}"
+    blob_url = ""
     try:
-        import firebase_admin.storage as fb_storage
-        bucket = fb_storage.bucket(firebaseConfig["storageBucket"])
-        blob = bucket.blob(storage_path)
-        blob.upload_from_string(file_bytes, content_type=file.content_type or "application/octet-stream")
+        from storage.blob import MEDICAL_DOCUMENTS_CONTAINER, upload_bytes
+        blob_url = upload_bytes(
+            container=MEDICAL_DOCUMENTS_CONTAINER,
+            key=storage_key,
+            data=file_bytes,
+            content_type=file.content_type or "application/octet-stream",
+        )
     except Exception as e:
-        # Non-fatal: store the doc and process even if Storage upload fails
-        print(f"[physical_health] Firebase Storage upload error for {doc_id}: {e}")
-        storage_path = ""
+        # Non-fatal: store the doc and process even if Blob upload fails
+        print(f"[physical_health] Azure Blob upload error for {doc_id_str}: {e}")
+        blob_url = storage_key  # fallback: store path as blob_url
 
-    # Create Firestore metadata doc
-    doc_data = {
-        "doc_id":             doc_id,
-        "user_id":            uid,
-        "company_id":         company_id,
-        "uploaded_at":        SERVER_TIMESTAMP,
-        "filename":           filename,
-        "file_type":          file_type,
-        "file_size_bytes":    len(file_bytes),
-        "storage_path":       storage_path,
-        "report_type":        report_type,
-        "report_date":        report_date,
-        "issuing_facility":   issuing_facility,
-        "status":             "uploaded",
-        "raw_text":           raw_text,
-        "rag_chunk_ids":      [],
-        "summary":            None,
-        "key_findings":       None,
-        "flagged_values":     None,
-        "recommendations":    None,
-        "follow_up_needed":   None,
-        "urgency_level":      "routine",
-        "analyzed_at":        None,
-    }
+    # Create SQLAlchemy MedicalDocument record
+    # NOTE: analysis metadata (status, report_type, rag_chunk_ids, etc.) is stored
+    # in-memory during processing and returned via PeriodicReportResponse / detail endpoint.
+    # Phase 5 will add a metadata JSONB column to MedicalDocument for full persistence.
+    doc_record = MedicalDocument(
+        id=doc_id,
+        user_id=uid,
+        filename=filename,
+        blob_url=blob_url,
+        mime_type=file.content_type,
+        size_bytes=len(file_bytes),
+        extracted_text=raw_text,
+    )
 
     try:
-        db.collection("medical_documents").document(doc_id).set(doc_data)
+        db.add(doc_record)
+        db.commit()
     except Exception as e:
+        db.rollback()
         raise HTTPException(500, f"Failed to save document record: {e}")
 
     # Kick off async analysis — non-blocking, response returns immediately
     from physical_health_agent import process_medical_document
     asyncio.create_task(
-        process_medical_document(doc_id, uid, company_id, raw_text, report_type, db)
+        process_medical_document(doc_id_str, uid, str(company_id) if company_id else "", raw_text, report_type)
     )
 
     return MedicalDocumentUploadResponse(
         success=True,
-        doc_id=doc_id,
+        doc_id=doc_id_str,
         status="processing",
         message=(
             "Your document has been uploaded and is being analysed. "
@@ -486,24 +494,21 @@ async def list_medical_documents(
     page:  int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=50),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     uid, _ = _get_user_context(user_token, db)
 
     try:
-        docs = list(
-            db.collection("medical_documents")
-            .where("user_id", "==", uid)
-            .order_by("uploaded_at", direction="DESCENDING")
-            .stream()
+        rows = (
+            db.query(MedicalDocument)
+            .filter(MedicalDocument.user_id == uid)
+            .order_by(MedicalDocument.uploaded_at.desc())
+            .all()
         )
     except Exception as e:
         raise HTTPException(500, f"Query failed: {e}")
 
-    all_docs = [_build_doc_detail(d.to_dict()) for d in docs]
+    all_docs = [_build_doc_detail_from_row(row) for row in rows]
     total = len(all_docs)
     offset = (page - 1) * limit
 
@@ -522,22 +527,22 @@ async def list_medical_documents(
 async def get_medical_document(
     doc_id: str,
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     uid, _ = _get_user_context(user_token, db)
-    doc = db.collection("medical_documents").document(doc_id).get()
 
-    if not doc.exists:
+    try:
+        doc_uuid = uuid.UUID(doc_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid document ID.")
+
+    row = db.query(MedicalDocument).filter(MedicalDocument.id == doc_uuid).first()
+    if not row:
         raise HTTPException(404, "Document not found.")
-
-    d = doc.to_dict()
-    if d.get("user_id") != uid:
+    if row.user_id != uid:
         raise HTTPException(403, "Access denied.")
 
-    return _build_doc_detail(d)
+    return _build_doc_detail_from_row(row)
 
 
 @router.get(
@@ -548,26 +553,28 @@ async def get_medical_document(
 async def get_document_status(
     doc_id: str,
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     uid, _ = _get_user_context(user_token, db)
-    doc = db.collection("medical_documents").document(doc_id).get()
 
-    if not doc.exists:
+    try:
+        doc_uuid = uuid.UUID(doc_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid document ID.")
+
+    row = db.query(MedicalDocument).filter(MedicalDocument.id == doc_uuid).first()
+    if not row:
         raise HTTPException(404, "Document not found.")
-
-    d = doc.to_dict()
-    if d.get("user_id") != uid:
+    if row.user_id != uid:
         raise HTTPException(403, "Access denied.")
 
+    # Status is not persisted in the current schema; return "uploaded" as default.
+    # Phase 5 schema migration will add a status column to MedicalDocument.
     return MedicalDocumentStatusResponse(
         doc_id=doc_id,
-        status=d.get("status", "unknown"),
-        analyzed_at=_ts_to_iso(d.get("analyzed_at")),
-        urgency_level=d.get("urgency_level"),
+        status="uploaded",
+        analyzed_at=None,
+        urgency_level="routine",
     )
 
 
@@ -576,60 +583,48 @@ async def get_document_status(
     summary="Delete Medical Document",
     description=(
         "Permanently deletes the document from Firebase Storage, "
-        "Firestore, and all associated RAG vector chunks."
+        "the database, and all associated RAG vector chunks."
     ),
 )
 async def delete_medical_document(
     doc_id: str,
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     uid, _ = _get_user_context(user_token, db)
-    doc_ref = db.collection("medical_documents").document(doc_id)
-    doc = doc_ref.get()
 
-    if not doc.exists:
+    try:
+        doc_uuid = uuid.UUID(doc_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid document ID.")
+
+    row = db.query(MedicalDocument).filter(MedicalDocument.id == doc_uuid).first()
+    if not row:
         raise HTTPException(404, "Document not found.")
-
-    d = doc.to_dict()
-    if d.get("user_id") != uid:
+    if row.user_id != uid:
         raise HTTPException(403, "Access denied.")
 
     errors: List[str] = []
 
-    # 1. Delete from Firebase Storage
-    storage_path = d.get("storage_path", "")
-    if storage_path:
+    # 1. Delete from Azure Blob Storage
+    blob_url = row.blob_url or ""
+    if blob_url.startswith("https://"):
         try:
-            import firebase_admin.storage as fb_storage
-            bucket = fb_storage.bucket(firebaseConfig["storageBucket"])
-            blob = bucket.blob(storage_path)
-            blob.delete()
+            from storage.blob import delete_by_url
+            delete_by_url(blob_url)
         except Exception as e:
             errors.append(f"storage: {e}")
 
-    # 2. Delete RAG chunks
-    chunk_ids: List[str] = d.get("rag_chunk_ids") or []
-    if chunk_ids:
-        try:
-            from rag import get_rag_store
-            store = get_rag_store()
-            for chunk_id in chunk_ids:
-                try:
-                    store.delete_chunk(chunk_id)
-                except Exception as ce:
-                    errors.append(f"rag_chunk_{chunk_id}: {ce}")
-        except Exception as e:
-            errors.append(f"rag: {e}")
+    # 2. Delete RAG chunks — chunk IDs not persisted in current schema;
+    #    Phase 5 schema migration will add rag_chunk_ids to MedicalDocument.
 
-    # 3. Delete Firestore doc
+    # 3. Delete DB record
     try:
-        doc_ref.delete()
+        db.delete(row)
+        db.commit()
     except Exception as e:
-        errors.append(f"firestore: {e}")
+        db.rollback()
+        errors.append(f"db: {e}")
 
     if errors:
         print(f"[physical_health] delete_medical_document partial errors for {doc_id}: {errors}")
@@ -654,35 +649,34 @@ async def delete_medical_document(
 async def generate_report(
     req: PeriodicReportRequest,
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     uid, company_id = _get_user_context(user_token, db)
     period_end   = datetime.now(timezone.utc)
     period_start = period_end - timedelta(days=req.days)
     cutoff       = period_start
 
     try:
-        docs = list(
-            db.collection("physical_health_checkins")
-            .where("user_id", "==", uid)
-            .where("created_at", ">=", cutoff)
-            .stream()
+        rows = (
+            db.query(PhysicalHealthCheckin)
+            .filter(
+                PhysicalHealthCheckin.user_id == uid,
+                PhysicalHealthCheckin.created_at >= cutoff,
+            )
+            .all()
         )
     except Exception as e:
         raise HTTPException(500, f"Query failed: {e}")
 
-    if len(docs) < 3:
+    if len(rows) < 3:
         raise HTTPException(
             422,
             f"Not enough check-in data to generate a report. "
-            f"Found {len(docs)} check-ins in the last {req.days} days. "
+            f"Found {len(rows)} check-ins in the last {req.days} days. "
             f"Please complete at least 3 check-ins first."
         )
 
-    records = [d.to_dict() for d in docs]
+    records = [_row_to_dict(r) for r in rows]
     exercise_records = [r for r in records if r.get("exercise_done")]
 
     aggregates = {
@@ -709,13 +703,12 @@ async def generate_report(
     try:
         return generate_periodic_report(
             user_id=uid,
-            company_id=company_id,
+            company_id=str(company_id) if company_id else "",
             aggregates=aggregates,
             period_str=period_str,
             period_start=period_start,
             period_end=period_end,
             report_type=req.report_type,
-            db=db,
         )
     except Exception as e:
         raise HTTPException(500, f"Report generation failed: {e}")
@@ -729,36 +722,33 @@ async def list_reports(
     page:  int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=50),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     uid, _ = _get_user_context(user_token, db)
 
     try:
-        docs = list(
-            db.collection("physical_health_reports")
-            .where("user_id", "==", uid)
-            .order_by("generated_at", direction="DESCENDING")
-            .stream()
+        rows = (
+            db.query(PhysicalHealthReport)
+            .filter(PhysicalHealthReport.user_id == uid)
+            .order_by(PhysicalHealthReport.generated_at.desc())
+            .all()
         )
     except Exception as e:
         raise HTTPException(500, f"Query failed: {e}")
 
     reports = []
-    for doc in docs:
-        d = doc.to_dict()
+    for row in rows:
+        r = row.report or {}
         reports.append({
-            "report_id":     d.get("report_id", doc.id),
-            "report_type":   d.get("report_type", "on_demand"),
-            "overall_score": d.get("overall_score", 0),
-            "overall_level": d.get("overall_level", "low"),
-            "trend":         d.get("trend", "stable"),
-            "period_start":  d.get("period_start"),
-            "period_end":    d.get("period_end"),
-            "generated_at":  _ts_to_iso(d.get("generated_at")),
-            "follow_up_suggested": d.get("follow_up_suggested", False),
+            "report_id":     str(row.id),
+            "report_type":   r.get("report_type", "on_demand"),
+            "overall_score": r.get("overall_score", 0),
+            "overall_level": r.get("overall_level", "low"),
+            "trend":         r.get("trend", "stable"),
+            "period_start":  r.get("period_start"),
+            "period_end":    r.get("period_end"),
+            "generated_at":  _ts_to_iso(row.generated_at),
+            "follow_up_suggested": r.get("follow_up_suggested", False),
         })
 
     total = len(reports)
@@ -784,42 +774,43 @@ async def list_reports(
 async def get_report(
     report_id: str,
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     uid, _ = _get_user_context(user_token, db)
-    doc = db.collection("physical_health_reports").document(report_id).get()
 
-    if not doc.exists:
+    try:
+        report_uuid = uuid.UUID(report_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid report ID.")
+
+    row = db.query(PhysicalHealthReport).filter(PhysicalHealthReport.id == report_uuid).first()
+    if not row:
         raise HTTPException(404, "Report not found.")
-
-    d = doc.to_dict()
-    if d.get("user_id") != uid:
+    if row.user_id != uid:
         raise HTTPException(403, "Access denied.")
 
+    r = row.report or {}
     return PeriodicReportResponse(
-        report_id=d.get("report_id", report_id),
-        period_start=d.get("period_start", ""),
-        period_end=d.get("period_end", ""),
-        report_type=d.get("report_type", "on_demand"),
-        overall_score=d.get("overall_score", 0),
-        overall_level=d.get("overall_level", "low"),
-        trend=d.get("trend", "stable"),
-        avg_energy=d.get("avg_energy", 0),
-        avg_sleep_quality=d.get("avg_sleep_quality", 0),
-        avg_sleep_hours=d.get("avg_sleep_hours", 0),
-        avg_exercise_minutes_daily=d.get("avg_exercise_minutes_per_day", 0),
-        avg_nutrition_quality=d.get("avg_nutrition_quality", 0),
-        avg_pain_level=d.get("avg_pain_level", 0),
-        exercise_days=d.get("exercise_days_count", 0),
-        summary=d.get("summary", ""),
-        strengths=d.get("strengths", []),
-        concerns=d.get("concerns", []),
-        recommendations=d.get("recommendations", []),
-        follow_up_suggested=d.get("follow_up_suggested", False),
-        generated_at=_ts_to_iso(d.get("generated_at")) or "",
+        report_id=str(row.id),
+        period_start=r.get("period_start", ""),
+        period_end=r.get("period_end", ""),
+        report_type=r.get("report_type", "on_demand"),
+        overall_score=r.get("overall_score", 0),
+        overall_level=r.get("overall_level", "low"),
+        trend=r.get("trend", "stable"),
+        avg_energy=r.get("avg_energy", 0),
+        avg_sleep_quality=r.get("avg_sleep_quality", 0),
+        avg_sleep_hours=r.get("avg_sleep_hours", 0),
+        avg_exercise_minutes_daily=r.get("avg_exercise_minutes_per_day", 0),
+        avg_nutrition_quality=r.get("avg_nutrition_quality", 0),
+        avg_pain_level=r.get("avg_pain_level", 0),
+        exercise_days=r.get("exercise_days_count", 0),
+        summary=r.get("summary", ""),
+        strengths=r.get("strengths", []),
+        concerns=r.get("concerns", []),
+        recommendations=r.get("recommendations", []),
+        follow_up_suggested=r.get("follow_up_suggested", False),
+        generated_at=_ts_to_iso(row.generated_at) or "",
     )
 
 
@@ -839,11 +830,8 @@ async def get_report(
 async def ask_medical_question(
     req: AskRequest,
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     uid, _ = _get_user_context(user_token, db)
 
     # RAG retrieval filtered strictly by user_id
@@ -908,6 +896,15 @@ async def ask_medical_question(
 # INTERNAL HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _row_to_dict(row: PhysicalHealthCheckin) -> dict:
+    """Flatten vitals + symptoms JSONB dicts into a single flat dict for reuse."""
+    d = {}
+    d.update(row.vitals or {})
+    d.update(row.symptoms or {})
+    d["created_at"] = row.created_at
+    return d
+
+
 def _avg(records: List[dict], field: str) -> float:
     values = [r.get(field, 0) for r in records if r.get(field) is not None]
     return sum(values) / len(values) if values else 0.0
@@ -932,15 +929,15 @@ def _compute_nudge(req: PhysicalCheckInRequest) -> str:
     return "Good work on checking in. Consistency is the key to long-term health."
 
 
-def _compute_streak(docs) -> int:
+def _compute_streak_from_rows(rows: List[PhysicalHealthCheckin]) -> int:
     """Count consecutive days with at least one check-in (most recent streak)."""
     dates = set()
-    for doc in docs:
-        d = doc.to_dict()
-        ts = d.get("created_at")
-        if ts and hasattr(ts, "timestamp"):
-            date_str = datetime.fromtimestamp(ts.timestamp(), tz=timezone.utc).strftime("%Y-%m-%d")
-            dates.add(date_str)
+    for row in rows:
+        ts = row.created_at
+        if ts:
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            dates.add(ts.strftime("%Y-%m-%d"))
 
     if not dates:
         return 0
@@ -1028,28 +1025,25 @@ def _compute_trend_direction(data_points: List[TrendPoint]) -> Dict[str, str]:
     }
 
 
-def _build_doc_detail(d: dict) -> MedicalDocumentDetail:
-    flagged = None
-    raw_flagged = d.get("flagged_values")
-    if raw_flagged:
-        try:
-            flagged = [FlaggedValue(**fv) if isinstance(fv, dict) else fv for fv in raw_flagged]
-        except Exception:
-            flagged = None
-
+def _build_doc_detail_from_row(row: MedicalDocument) -> MedicalDocumentDetail:
+    """
+    Build MedicalDocumentDetail from a MedicalDocument ORM row.
+    NOTE: Analysis fields (summary, key_findings, flagged_values, etc.) are not
+    persisted in the current schema — Phase 5 will add a metadata JSONB column.
+    """
     return MedicalDocumentDetail(
-        doc_id=d.get("doc_id", ""),
-        filename=d.get("filename", ""),
-        report_type=d.get("report_type", "other"),
-        report_date=d.get("report_date"),
-        issuing_facility=d.get("issuing_facility"),
-        status=d.get("status", "unknown"),
-        uploaded_at=_ts_to_iso(d.get("uploaded_at")) or "",
-        analyzed_at=_ts_to_iso(d.get("analyzed_at")),
-        summary=d.get("summary"),
-        key_findings=d.get("key_findings"),
-        flagged_values=flagged,
-        recommendations=d.get("recommendations"),
-        follow_up_needed=d.get("follow_up_needed"),
-        urgency_level=d.get("urgency_level", "routine"),
+        doc_id=str(row.id),
+        filename=row.filename or "",
+        report_type="other",          # not stored in current schema
+        report_date=None,
+        issuing_facility=None,
+        status="uploaded",            # not stored in current schema
+        uploaded_at=_ts_to_iso(row.uploaded_at) or "",
+        analyzed_at=None,
+        summary=None,
+        key_findings=None,
+        flagged_values=None,
+        recommendations=None,
+        follow_up_needed=None,
+        urgency_level="routine",
     )

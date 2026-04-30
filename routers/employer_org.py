@@ -9,25 +9,29 @@ Privacy rules:
   - Risk bands: low / medium / high only
 """
 
+import uuid
 import statistics
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
-from firebase_config import get_db
+from db.models import CheckIn, Intervention, MHSession, User
+from db.session import get_session
 from routers.auth import get_current_user
+from utils.audit import log_audit
+
+# Import pure-Python utility helpers from employer_dashboard (no Firestore calls).
 from routers.employer_dashboard import (
     K_ANON_THRESHOLD,
     utc_now,
     _ts_to_dt,
     _week_label,
     _size_band,
-    _require_employer,
-    _fetch_company_check_ins,
-    _fetch_sessions,
-    _compute_team_size,
+    _cache_get,
+    _cache_set,
 )
 
 router = APIRouter(
@@ -36,21 +40,181 @@ router = APIRouter(
     dependencies=[Depends(get_current_user)],
 )
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# ─── SQLAlchemy Helpers ───────────────────────────────────────────────────────
 
-def _fetch_all_users(company_id: str, db) -> List[dict]:
-    from routers.employer_dashboard import _cache_get, _cache_set
-    cache_key = f"all_users:{company_id}"
+
+def _require_employer_sa(user_token: dict, db: Session) -> dict:
+    """Raise 403 if caller is not an employer / manager / hr (Postgres version)."""
+    uid = user_token.get("uid") or user_token.get("id", "")
+    cache_key = f"employer_role:{uid}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
+        raise HTTPException(403, "User profile not found")
+    if user.role not in ("employer", "manager", "hr"):
+        raise HTTPException(403, "Access restricted to employer accounts")
+
+    profile = {
+        "id": user.id,
+        "email": user.email,
+        "role": user.role,
+        "company_id": str(user.company_id) if user.company_id else None,
+        "is_active": user.is_active,
+        **(user.profile or {}),
+    }
+    _cache_set(cache_key, profile)
+    return profile
+
+
+def _fetch_all_users_sa(company_id_uuid: uuid.UUID, db: Session) -> List[dict]:
+    """Fetch all active users for a company from Postgres."""
+    cid_str = str(company_id_uuid)
+    cache_key = f"all_users:{cid_str}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
     try:
-        docs = db.collection("users").where("company_id", "==", company_id).stream()
-        results = [d.to_dict() for d in docs]
+        users = (
+            db.query(User)
+            .filter(User.company_id == company_id_uuid, User.is_active == True)  # noqa: E712
+            .all()
+        )
+        results = [
+            {
+                "id": u.id,
+                "department": u.department,
+                "company_id": cid_str,
+                **(u.profile or {}),
+            }
+            for u in users
+        ]
         _cache_set(cache_key, results)
         return results
     except Exception as e:
         print(f"[employer_org] users fetch error: {e}")
+        return []
+
+
+def _fetch_company_check_ins_sa(
+    company_id_uuid: uuid.UUID, db: Session, days: int = 90
+) -> List[dict]:
+    """Fetch check-ins for a company from Postgres (last `days` days)."""
+    cid_str = str(company_id_uuid)
+    cache_key = f"check_ins:{cid_str}:{days}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    cutoff = utc_now() - timedelta(days=days)
+    try:
+        rows = (
+            db.query(CheckIn)
+            .filter(
+                CheckIn.company_id == company_id_uuid,
+                CheckIn.created_at >= cutoff,
+            )
+            .all()
+        )
+        results = []
+        for r in rows:
+            d = r.data or {}
+            results.append(
+                {
+                    "user_id": r.user_id,
+                    "company_id": cid_str,
+                    "mood_score": d.get("mood_score", d.get("mood_rating", 5)),
+                    "stress_level": d.get("stress_level", 5),
+                    "created_at": r.created_at,
+                }
+            )
+        _cache_set(cache_key, results)
+        return results
+    except Exception as e:
+        print(f"[employer_org] check-ins fetch error: {e}")
+        return []
+
+
+def _fetch_sessions_sa(
+    company_id_uuid: uuid.UUID, db: Session, days: int = 90
+) -> List[dict]:
+    """Fetch sessions for a company from Postgres (last `days` days)."""
+    cid_str = str(company_id_uuid)
+    cache_key = f"sessions:{cid_str}:{days}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    cutoff = utc_now() - timedelta(days=days)
+    try:
+        rows = (
+            db.query(MHSession)
+            .filter(
+                MHSession.company_id == company_id_uuid,
+                MHSession.created_at >= cutoff,
+            )
+            .all()
+        )
+        results = [
+            {
+                "user_id": r.user_id,
+                "company_id": cid_str,
+                "created_at": r.created_at,
+                "modality": (r.messages or {}).get("modality") if isinstance(r.messages, dict) else None,
+                "completed": r.ended_at is not None,
+            }
+            for r in rows
+        ]
+        _cache_set(cache_key, results)
+        return results
+    except Exception as e:
+        print(f"[employer_org] sessions fetch error: {e}")
+        return []
+
+
+def _compute_team_size_sa(company_id_uuid: uuid.UUID, db: Session) -> int:
+    """Count active users for a company from Postgres."""
+    cid_str = str(company_id_uuid)
+    cache_key = f"team_size:{cid_str}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        size = (
+            db.query(User)
+            .filter(User.company_id == company_id_uuid, User.is_active == True)  # noqa: E712
+            .count()
+        )
+        _cache_set(cache_key, size)
+        return size
+    except Exception as e:
+        print(f"[employer_org] team size error: {e}")
+        return 0
+
+
+def _intervention_records_sa(company_id_uuid: uuid.UUID, db: Session) -> List[dict]:
+    """Fetch intervention records for a company from Postgres."""
+    try:
+        rows = (
+            db.query(Intervention)
+            .filter(Intervention.company_id == company_id_uuid)
+            .all()
+        )
+        return [
+            {
+                "id": str(r.id),
+                "company_id": str(company_id_uuid),
+                "user_id": r.user_id,
+                "status": r.status,
+                "created_at": r.created_at,
+                **(r.data or {}),
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        print(f"[employer_org] interventions fetch error: {e}")
         return []
 
 
@@ -60,17 +224,12 @@ def _mask_dept_labels(depts: List[str]) -> Dict[str, str]:
     return {dept: labels[i % 26] for i, dept in enumerate(sorted(set(depts)))}
 
 
-def _intervention_records(company_id: str, db) -> List[dict]:
+def _parse_company_uuid(company_id: str) -> uuid.UUID:
+    """Parse a company_id string to UUID, raising HTTP 400 on failure."""
     try:
-        docs = (
-            db.collection("interventions")
-            .where("company_id", "==", company_id)
-            .stream()
-        )
-        return [d.to_dict() for d in docs]
-    except Exception as e:
-        print(f"[employer_org] interventions fetch error: {e}")
-        return []
+        return uuid.UUID(company_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid company_id format")
 
 
 # ─── Schemas ─────────────────────────────────────────────────────────────────
@@ -196,20 +355,18 @@ async def get_org_wellness_trend(
     company_id: str = Query(...),
     weeks: int = Query(12, ge=4, le=26),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer_sa(user_token, db)
     if profile.get("company_id") != company_id:
         raise HTTPException(403, "Access denied for this company")
 
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
-    team_size = _compute_team_size(company_id, db)
+    cid = _parse_company_uuid(company_id)
+    team_size = _compute_team_size_sa(cid, db)
     if team_size < K_ANON_THRESHOLD:
         raise HTTPException(422, {"error": "insufficient_cohort", "suppressed": True})
 
-    check_ins = _fetch_company_check_ins(company_id, db, days=weeks * 7)
+    check_ins = _fetch_company_check_ins_sa(cid, db, days=weeks * 7)
 
     weekly_data: Dict[str, Dict[str, Any]] = {}
     for c in check_ins:
@@ -270,18 +427,16 @@ async def get_department_comparison(
     period_days: int = Query(30, ge=7, le=90),
     mask_labels: bool = Query(True, description="True = use A/B/C labels instead of real dept names"),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer_sa(user_token, db)
     if profile.get("company_id") != company_id:
         raise HTTPException(403, "Access denied for this company")
 
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
-    all_users = _fetch_all_users(company_id, db)
-    check_ins = _fetch_company_check_ins(company_id, db, days=period_days)
-    sessions  = _fetch_sessions(company_id, db, days=period_days)
+    cid = _parse_company_uuid(company_id)
+    all_users = _fetch_all_users_sa(cid, db)
+    check_ins = _fetch_company_check_ins_sa(cid, db, days=period_days)
+    sessions  = _fetch_sessions_sa(cid, db, days=period_days)
 
     # Build per-department aggregates
     dept_users: Dict[str, set] = {}
@@ -363,21 +518,19 @@ async def get_retention_risk(
     company_id: str = Query(...),
     period_days: int = Query(60, ge=14, le=180),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer_sa(user_token, db)
     if profile.get("company_id") != company_id:
         raise HTTPException(403, "Access denied for this company")
 
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
-    team_size = _compute_team_size(company_id, db)
+    cid = _parse_company_uuid(company_id)
+    team_size = _compute_team_size_sa(cid, db)
     if team_size < K_ANON_THRESHOLD:
         raise HTTPException(422, {"error": "insufficient_cohort", "suppressed": True})
 
-    check_ins = _fetch_company_check_ins(company_id, db, days=period_days)
-    sessions  = _fetch_sessions(company_id, db, days=period_days)
+    check_ins = _fetch_company_check_ins_sa(cid, db, days=period_days)
+    sessions  = _fetch_sessions_sa(cid, db, days=period_days)
 
     # Retention risk model:
     # Per user: compute a risk score based on stress trend + engagement drop
@@ -421,7 +574,7 @@ async def get_retention_risk(
         raise HTTPException(422, {"error": "insufficient_cohort", "suppressed": True})
 
     # Compute prior period for trend
-    prior_check = _fetch_company_check_ins(company_id, db, days=period_days * 2)
+    prior_check = _fetch_company_check_ins_sa(cid, db, days=period_days * 2)
     prior_check = [c for c in prior_check if (_ts_to_dt(c.get("created_at")) or utc_now()) < utc_now() - timedelta(days=period_days)]
 
     prior_stress_vals = [c.get("stress_level", 5) for c in prior_check]
@@ -463,20 +616,18 @@ async def get_diltak_engagement(
     company_id: str = Query(...),
     period_days: int = Query(30, ge=7, le=90),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer_sa(user_token, db)
     if profile.get("company_id") != company_id:
         raise HTTPException(403, "Access denied for this company")
 
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
-    team_size = _compute_team_size(company_id, db)
+    cid = _parse_company_uuid(company_id)
+    team_size = _compute_team_size_sa(cid, db)
     if team_size < K_ANON_THRESHOLD:
         raise HTTPException(422, {"error": "insufficient_cohort", "suppressed": True})
 
-    sessions = _fetch_sessions(company_id, db, days=period_days)
+    sessions = _fetch_sessions_sa(cid, db, days=period_days)
 
     # Adoption: unique users
     unique_users = {s.get("user_id") for s in sessions}
@@ -527,21 +678,19 @@ async def get_roi_impact(
     company_id: str = Query(...),
     weeks: int = Query(8, ge=4, le=24),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer_sa(user_token, db)
     if profile.get("company_id") != company_id:
         raise HTTPException(403, "Access denied for this company")
 
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
-    team_size = _compute_team_size(company_id, db)
+    cid = _parse_company_uuid(company_id)
+    team_size = _compute_team_size_sa(cid, db)
     if team_size < K_ANON_THRESHOLD:
         raise HTTPException(422, {"error": "insufficient_cohort", "suppressed": True})
 
-    check_ins = _fetch_company_check_ins(company_id, db, days=weeks * 7)
-    sessions  = _fetch_sessions(company_id, db, days=weeks * 7)
+    check_ins = _fetch_company_check_ins_sa(cid, db, days=weeks * 7)
+    sessions  = _fetch_sessions_sa(cid, db, days=weeks * 7)
 
     # Build weekly wellness index + session engagement for correlation
     weekly_ci: Dict[str, Dict] = {}
@@ -612,36 +761,57 @@ async def get_roi_impact(
 async def log_intervention(
     req: LogInterventionRequest,
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer_sa(user_token, db)
     if profile.get("company_id") != req.company_id:
         raise HTTPException(403, "Access denied for this company")
 
     if req.end_date <= req.start_date:
         raise HTTPException(422, "end_date must be after start_date")
 
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
+    cid = _parse_company_uuid(req.company_id)
     now = utc_now()
-    doc = {
-        "company_id": req.company_id,
-        "label":      req.label,
-        "start_date": req.start_date.isoformat(),
-        "end_date":   req.end_date.isoformat(),
-        "created_at": now.isoformat(),
-        "created_by": profile.get("id") or profile.get("uid", ""),
-    }
+
+    actor_uid = profile.get("id") or profile.get("uid", "")
+
+    intv_id = uuid.uuid4()
+    intervention = Intervention(
+        id=intv_id,
+        company_id=cid,
+        user_id=None,
+        data={
+            "label":      req.label,
+            "start_date": req.start_date.isoformat(),
+            "end_date":   req.end_date.isoformat(),
+            "created_by": actor_uid,
+        },
+        status="logged",
+    )
 
     try:
-        ref = db.collection("interventions").document()
-        ref.set(doc)
+        db.add(intervention)
+        db.commit()
     except Exception as e:
+        db.rollback()
         raise HTTPException(500, f"Failed to save intervention: {e}")
 
+    log_audit(
+        actor_uid=actor_uid,
+        actor_role=profile.get("role", "employer"),
+        action="intervention.log",
+        company_id=req.company_id,
+        target_uid=str(intv_id),
+        target_type="intervention",
+        metadata={
+            "label":      req.label,
+            "start_date": req.start_date.isoformat(),
+            "end_date":   req.end_date.isoformat(),
+        },
+    )
+
     return LogInterventionResponse(
-        id=ref.id,
+        id=str(intv_id),
         company_id=req.company_id,
         label=req.label,
         start_date=req.start_date.isoformat(),
@@ -659,20 +829,18 @@ async def log_intervention(
 async def get_program_effectiveness(
     company_id: str = Query(...),
     user_token: dict = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
-    profile = _require_employer(user_token)
+    profile = _require_employer_sa(user_token, db)
     if profile.get("company_id") != company_id:
         raise HTTPException(403, "Access denied for this company")
 
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
-    team_size = _compute_team_size(company_id, db)
+    cid = _parse_company_uuid(company_id)
+    team_size = _compute_team_size_sa(cid, db)
     if team_size < K_ANON_THRESHOLD:
         raise HTTPException(422, {"error": "insufficient_cohort", "suppressed": True})
 
-    interventions = _intervention_records(company_id, db)
+    interventions = _intervention_records_sa(cid, db)
 
     def _wi(cis: list) -> float:
         ms  = [c.get("mood_score", 5)  for c in cis if "mood_score"  in c]
@@ -693,13 +861,15 @@ async def get_program_effectiveness(
             continue
 
         window    = (end_ts - start_ts).days
-        before_ci = _fetch_company_check_ins(company_id, db, days=window * 2)
+        before_ci = _fetch_company_check_ins_sa(cid, db, days=window * 2)
+        # before: window days before start
         before_ci = [
             c for c in before_ci
             if start_ts - timedelta(days=window) <=
                (_ts_to_dt(c.get("created_at")) or start_ts) < start_ts
         ]
-        after_ci = _fetch_company_check_ins(company_id, db, days=window)
+        # after: window days after start
+        after_ci = _fetch_company_check_ins_sa(cid, db, days=window)
 
         if len(before_ci) < K_ANON_THRESHOLD or len(after_ci) < K_ANON_THRESHOLD:
             cohorts.append(InterventionCohort(
@@ -752,8 +922,8 @@ async def get_program_effectiveness(
 
     if not cohorts:
         recommendation = (
-            "Not enough check-in data yet. Use POST /program-effectiveness/log to record "
-            "a program, or wait for more employee check-ins to accumulate."
+            "No intervention records found. Log programs in the 'interventions' table "
+            "to enable before/after effectiveness analysis."
         )
     elif overall_lift is not None and overall_lift >= 3:
         recommendation = "Interventions show positive impact. Continue and scale successful programs."

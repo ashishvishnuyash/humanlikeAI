@@ -1,12 +1,17 @@
 import os
 import json
 import time
+import uuid
 from datetime import datetime
 from typing import List
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from openai import OpenAI
-from firebase_config import get_db
+from sqlalchemy.orm import Session
+
+from db.session import get_session
+from db.models.mental_health import AIRecommendation as AIRecommendationModel, ChatSession
+from middleware.usage_tracker import track_usage, tokens_from_openai_completion
 from routers.auth import get_current_user
 from middleware.usage_tracker import track_usage, tokens_from_openai_completion
 
@@ -55,7 +60,7 @@ def get_openai_client():
 def generate_fallback_recommendations(current_mood: int, current_stress: int, current_energy: int, time_available: int) -> List[dict]:
     now = datetime.utcnow().isoformat() + "Z"
     recommendations = []
-    
+
     if current_stress >= 7:
         recommendations.append({
             "id": f"stress_relief_{int(datetime.now().timestamp()*1000)}",
@@ -79,7 +84,7 @@ def generate_fallback_recommendations(current_mood: int, current_stress: int, cu
             "personalized_for_user": True,
             "created_at": now
         })
-        
+
     if current_energy <= 4:
         recommendations.append({
             "id": f"energy_boost_{int(datetime.now().timestamp()*1000)}",
@@ -102,7 +107,7 @@ def generate_fallback_recommendations(current_mood: int, current_stress: int, cu
             "personalized_for_user": True,
             "created_at": now
         })
-        
+
     if current_mood <= 4:
         recommendations.append({
             "id": f"mood_lift_{int(datetime.now().timestamp()*1000)}",
@@ -124,7 +129,7 @@ def generate_fallback_recommendations(current_mood: int, current_stress: int, cu
             "personalized_for_user": True,
             "created_at": now
         })
-        
+
     recommendations.append({
         "id": f"work_life_balance_{int(datetime.now().timestamp()*1000)}",
         "recommendation_type": "work_life_balance",
@@ -145,7 +150,7 @@ def generate_fallback_recommendations(current_mood: int, current_stress: int, cu
         "personalized_for_user": True,
         "created_at": now
     })
-    
+
     recommendations.append({
         "id": f"meditation_{int(datetime.now().timestamp()*1000)}",
         "recommendation_type": "meditation",
@@ -166,7 +171,7 @@ def generate_fallback_recommendations(current_mood: int, current_stress: int, cu
         "personalized_for_user": True,
         "created_at": now
     })
-    
+
     recommendations.append({
         "id": f"social_connection_{int(datetime.now().timestamp()*1000)}",
         "recommendation_type": "social",
@@ -187,72 +192,59 @@ def generate_fallback_recommendations(current_mood: int, current_stress: int, cu
         "personalized_for_user": True,
         "created_at": now
     })
-    
+
     return recommendations[:6]
 
-async def get_user_chat_history(user_id: str, company_id: str, days: int = 7) -> List[dict]:
-    db = get_db()
-    if not db:
-        return []
-    
+async def get_user_chat_history(user_id: str, days: int, db: Session) -> List[dict]:
+    """Fetch recent chat sessions for a user from Postgres."""
     try:
-        chat_ref = db.collection('chat_sessions')
-        # Without composite indexes, doing simple query and filtering in memory
-        docs = chat_ref.where('user_id', '==', user_id).where('company_id', '==', company_id).limit(50).stream()
-        
-        sessions = []
-        now = datetime.utcnow()
-        for doc in docs:
-            data = doc.to_dict()
-            data['id'] = doc.id
-            if 'created_at' in data:
-                # Handle Firestore datetime
-                created_dt = data['created_at']
-                if hasattr(created_dt, 'timestamp'):
-                    dt = datetime.fromtimestamp(created_dt.timestamp())
-                elif isinstance(created_dt, datetime):
-                    dt = created_dt
-                else:
-                    # Fallback string parsing if needed
-                    try:
-                        dt = datetime.fromisoformat(str(created_dt).replace("Z", "+00:00"))
-                    except:
-                        dt = now
-                
-                delta = now - dt.replace(tzinfo=None)
-                if delta.days <= days:
-                    sessions.append((dt, data))
-
-        # Sort descending by date and take top 20
-        sessions.sort(key=lambda x: x[0], reverse=True)
-        return [s[1] for s in sessions[:20]]
+        from datetime import timedelta
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        sessions = (
+            db.query(ChatSession)
+            .filter(ChatSession.user_id == user_id, ChatSession.created_at >= cutoff)
+            .order_by(ChatSession.created_at.desc())
+            .limit(20)
+            .all()
+        )
+        result = []
+        for s in sessions:
+            result.append({
+                "id": str(s.id),
+                "user_id": s.user_id,
+                "messages": s.messages if isinstance(s.messages, list) else [],
+                "created_at": s.created_at,
+            })
+        return result
     except Exception as e:
-        print(f"Error fetching chat history from Firebase: {e}")
+        print(f"Error fetching chat history: {e}")
         return []
 
 @router.post("/generate", response_model=RecommendationResponse)
-async def generate_recommendations(req: RecommendationRequest):
+async def generate_recommendations(
+    req: RecommendationRequest,
+    db: Session = Depends(get_session),
+):
     if req.current_mood < 1 or req.current_mood > 10 or req.current_stress < 1 or req.current_stress > 10 or req.current_energy < 1 or req.current_energy > 10:
         raise HTTPException(status_code=400, detail="Mood, stress, and energy values must be between 1 and 10")
-        
+
     try:
-        chat_history = await get_user_chat_history(req.employee_id, req.company_id, 7)
-        
+        chat_history = await get_user_chat_history(req.employee_id, 7, db)
+
         chat_context = "No recent chat history available."
         if chat_history:
             parts = []
             for s in chat_history:
                 dt_str = "Unknown"
-                if 'created_at' in s:
-                    if hasattr(s['created_at'], 'strftime'):
-                        dt_str = s['created_at'].strftime('%Y-%m-%d')
-                
+                if 'created_at' in s and hasattr(s['created_at'], 'strftime'):
+                    dt_str = s['created_at'].strftime('%Y-%m-%d')
+
                 messages = " ".join([m.get("content", "") for m in s.get("messages", [])])
                 parts.append(f"Session {dt_str}: {messages}")
             chat_context = "\n".join(parts)
-            
+
         openai_client = get_openai_client()
-        
+
         prompt = f"""You are an AI wellness coach analyzing an employee's recent chat conversations and current state to generate personalized wellness recommendations.
 
 EMPLOYEE CONTEXT:
@@ -307,17 +299,16 @@ Guidelines:
             temperature=0.7,
             max_tokens=2000,
         )
-        _latency = int((time.time() - _t0) * 1000)
+        _latency_ms = int((time.time() - _t0) * 1000)
         _tin, _tout = tokens_from_openai_completion(completion)
         track_usage(
-            user_id    = req.employee_id,
-            company_id = req.company_id,
-            feature    = "recommendation",
-            model      = "gpt-4",
-            tokens_in  = _tin,
-            tokens_out = _tout,
-            db         = get_db(),
-            latency_ms = _latency,
+            user_id=req.employee_id,
+            company_id=req.company_id,
+            feature="recommendation",
+            model="gpt-4",
+            tokens_in=_tin,
+            tokens_out=_tout,
+            latency_ms=_latency_ms,
         )
 
         response_text = completion.choices[0].message.content
@@ -327,32 +318,44 @@ Guidelines:
                 raise ValueError("Response is not a JSON array")
         except:
             recommendations = generate_fallback_recommendations(req.current_mood, req.current_stress, req.current_energy, req.time_available)
-            
+
     except Exception as e:
         print(f"Error generating AI recommendations: {e}")
         recommendations = generate_fallback_recommendations(req.current_mood, req.current_stress, req.current_energy, req.time_available)
 
-    # Store in database
-    db = get_db()
-    now_iso = datetime.utcnow().isoformat() + "Z"
-    if db:
-        from google.cloud.firestore_v1 import SERVER_TIMESTAMP
+    # Parse company_id — treat invalid/empty strings as None
+    company_uuid: uuid.UUID | None = None
+    if req.company_id:
         try:
-            db.collection("ai_recommendations").add({
-                "employee_id": req.employee_id,
-                "company_id": req.company_id,
+            company_uuid = uuid.UUID(req.company_id)
+        except ValueError:
+            company_uuid = None
+
+    now_iso = datetime.utcnow().isoformat() + "Z"
+
+    # Persist to Postgres
+    try:
+        ar = AIRecommendationModel(
+            id=uuid.uuid4(),
+            user_id=req.employee_id,
+            company_id=company_uuid,
+            recommendation={
                 "recommendations": recommendations,
                 "context": {
                     "current_mood": req.current_mood,
                     "current_stress": req.current_stress,
                     "current_energy": req.current_energy,
-                    "time_available": req.time_available
+                    "time_available": req.time_available,
                 },
-                "created_at": SERVER_TIMESTAMP,
-                "generated_at": now_iso
-            })
-        except Exception as e:
-            print(f"Error saving recommendation to db: {e}")
+                "generated_at": now_iso,
+            },
+            category="wellness",
+        )
+        db.add(ar)
+        db.commit()
+    except Exception as e:
+        print(f"Error saving recommendation to db: {e}")
+        db.rollback()
 
     return {
         "success": True,

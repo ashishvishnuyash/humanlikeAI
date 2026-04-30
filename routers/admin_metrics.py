@@ -30,15 +30,28 @@ Phase D — Gamification Admin
 All endpoints require super_admin role.
 """
 
+from __future__ import annotations
+
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from firebase_config import get_db
-from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 from pydantic import BaseModel
+from sqlalchemy import func
+from sqlalchemy.orm import Session
 
+from db.models import (
+    AuditLog,
+    Company,
+    CompanyCredit,
+    GamificationEvent,
+    UsageLog,
+    User,
+    UserGamification,
+    WellnessChallenge,
+)
+from db.session import get_session
 from routers.auth import get_super_admin_user
 
 router = APIRouter(prefix="/admin", tags=["Admin Metrics"])
@@ -50,10 +63,12 @@ def _ts_to_iso(ts) -> Optional[str]:
     if ts is None:
         return None
     try:
+        if isinstance(ts, datetime):
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return ts.isoformat()
         if hasattr(ts, "timestamp"):
             return datetime.fromtimestamp(ts.timestamp(), tz=timezone.utc).isoformat()
-        if isinstance(ts, datetime):
-            return ts.isoformat()
     except Exception:
         pass
     return str(ts)
@@ -71,6 +86,20 @@ def _safe_int(val, default: int = 0) -> int:
         return int(val)
     except (TypeError, ValueError):
         return default
+
+
+def _parse_company_uuid(company_id: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(company_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(400, f"Invalid company_id: {company_id!r}")
+
+
+def _parse_challenge_uuid(challenge_id: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(challenge_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(400, f"Invalid challenge_id: {challenge_id!r}")
 
 
 # ─── Schemas ──────────────────────────────────────────────────────────────────
@@ -199,39 +228,39 @@ class AuditEntry(BaseModel):
     response_model=PlatformOverview,
     summary="Platform Overview KPIs",
 )
-async def admin_overview(_: dict = Depends(get_super_admin_user)):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
+async def admin_overview(
+    _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
+):
     now = datetime.now(timezone.utc)
-    cutoff_30d = now.timestamp() - 30 * 86400
+    cutoff_30d = now - timedelta(days=30)
 
     # ── Users ──────────────────────────────────────────────────────────────
     try:
-        all_users = list(db.collection("users").stream())
+        all_users: List[User] = db.query(User).all()
     except Exception as e:
         raise HTTPException(500, f"users query failed: {e}")
 
     total_employers = total_employees = active = inactive = new_30d = 0
-    for doc in all_users:
-        d = doc.to_dict()
-        role = d.get("role", "unknown")
+    for u in all_users:
+        role = u.role or "unknown"
         if role == "employer":
             total_employers += 1
         elif role not in ("super_admin",):
             total_employees += 1
-        if d.get("is_active", True):
+        if u.is_active:
             active += 1
         else:
             inactive += 1
-        ts = d.get("created_at") or d.get("registered_at")
-        if ts and hasattr(ts, "timestamp") and ts.timestamp() >= cutoff_30d:
-            new_30d += 1
+        ts = u.created_at
+        if ts is not None:
+            ts_aware = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+            if ts_aware >= cutoff_30d:
+                new_30d += 1
 
     # ── Companies ──────────────────────────────────────────────────────────
     try:
-        all_companies = len(list(db.collection("companies").stream()))
+        all_companies = db.query(func.count(Company.id)).scalar() or 0
     except Exception:
         all_companies = total_employers
 
@@ -241,12 +270,10 @@ async def admin_overview(_: dict = Depends(get_super_admin_user)):
     at_warning = 0
     at_critical = 0
     try:
-        credit_docs = db.collection("company_credits").stream()
-        for doc in credit_docs:
-            d = doc.to_dict()
-            total_consumed += _safe_float(d.get("credits_consumed_mtd"))
-            total_lifetime += _safe_float(d.get("total_lifetime_spend_usd"))
-            status = d.get("alert_status", "normal")
+        for cc in db.query(CompanyCredit).all():
+            total_consumed += _safe_float(cc.credits_consumed_mtd)
+            total_lifetime += _safe_float(cc.total_lifetime_spend_usd)
+            status = cc.alert_status or "normal"
             if status == "warning":
                 at_warning += 1
             elif status in ("critical", "limit_reached"):
@@ -255,7 +282,7 @@ async def admin_overview(_: dict = Depends(get_super_admin_user)):
         print(f"[admin_metrics] credits aggregate error: {e}")
 
     return PlatformOverview(
-        totalCompanies=all_companies,
+        totalCompanies=int(all_companies),
         totalEmployers=total_employers,
         totalEmployees=total_employees,
         activeUsers=active,
@@ -282,57 +309,54 @@ async def admin_list_companies(
     page:             int           = Query(1, ge=1),
     limit:            int           = Query(20, ge=1, le=100),
     _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     try:
-        company_docs = list(db.collection("companies").stream())
+        company_rows: List[Company] = db.query(Company).all()
     except Exception as e:
         raise HTTPException(500, f"companies query failed: {e}")
 
     # Build credit map for O(1) lookups
-    credit_map: Dict[str, dict] = {}
+    credit_map: Dict[str, CompanyCredit] = {}
     try:
-        for doc in db.collection("company_credits").stream():
-            credit_map[doc.id] = doc.to_dict()
+        for cc in db.query(CompanyCredit).all():
+            credit_map[str(cc.company_id)] = cc
     except Exception as e:
         print(f"[admin_metrics] credit_map error: {e}")
 
     result: List[CompanySummary] = []
-    for doc in company_docs:
-        d     = doc.to_dict()
-        cid   = doc.id
-        creds = credit_map.get(cid, {})
+    for company in company_rows:
+        s = company.settings or {}
+        cid = str(company.id)
+        creds = credit_map.get(cid)
 
         if search:
             term = search.lower()
-            searchable = f"{d.get('name','').lower()} {d.get('industry','').lower()}"
+            searchable = f"{(company.name or '').lower()} {(s.get('industry') or '').lower()}"
             if term not in searchable:
                 continue
 
-        a_status = creds.get("alert_status", "normal")
+        a_status = (creds.alert_status if creds else None) or "normal"
         if alert_status and a_status != alert_status:
             continue
 
-        pt = creds.get("plan_tier") or d.get("plan_tier")
+        pt = (creds.plan_tier if creds else None) or s.get("plan_tier")
         if plan_tier and pt != plan_tier:
             continue
 
         result.append(CompanySummary(
             id=cid,
-            name=d.get("name", ""),
-            industry=d.get("industry"),
+            name=company.name or "",
+            industry=s.get("industry"),
             planTier=pt,
-            employeeCount=_safe_int(d.get("employee_count")),
-            creditLimitUsd=_safe_float(creds.get("credit_limit_usd", 10.0)),
-            creditsConsumedMtd=_safe_float(creds.get("credits_consumed_mtd")),
-            creditsRemaining=_safe_float(creds.get("credits_remaining", 10.0)),
+            employeeCount=_safe_int(company.employee_count),
+            creditLimitUsd=_safe_float(creds.credit_limit_usd if creds else 10.0, 10.0),
+            creditsConsumedMtd=_safe_float(creds.credits_consumed_mtd if creds else 0),
+            creditsRemaining=_safe_float(creds.credits_remaining if creds else 10.0, 10.0),
             alertStatus=a_status,
-            totalLifetimeSpend=_safe_float(creds.get("total_lifetime_spend_usd")),
-            ownerId=d.get("owner_id"),
-            createdAt=_ts_to_iso(d.get("created_at")),
+            totalLifetimeSpend=_safe_float(creds.total_lifetime_spend_usd if creds else 0),
+            ownerId=company.owner_id,
+            createdAt=_ts_to_iso(company.created_at),
         ))
 
     total = len(result)
@@ -359,41 +383,35 @@ async def admin_list_companies(
 async def admin_get_company_detail(
     company_id: str,
     _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    cid_uuid = _parse_company_uuid(company_id)
 
     # Company doc
-    company_doc = db.collection("companies").document(company_id).get()
-    if not company_doc.exists:
+    company = db.query(Company).filter(Company.id == cid_uuid).one_or_none()
+    if company is None:
         raise HTTPException(404, "Company not found.")
-    cd = company_doc.to_dict()
+    s = company.settings or {}
 
     # Credits doc
-    creds_doc = db.collection("company_credits").document(company_id).get()
-    creds = creds_doc.to_dict() if creds_doc.exists else {}
+    creds = db.query(CompanyCredit).filter(CompanyCredit.company_id == cid_uuid).one_or_none()
 
     # Employees
     employees: List[Dict[str, Any]] = []
     try:
-        emp_docs = (
-            db.collection("users")
-            .where("company_id", "==", company_id)
-            .stream()
-        )
-        for doc in emp_docs:
-            d = doc.to_dict()
-            if d.get("role") in ("super_admin",):
+        emp_rows: List[User] = db.query(User).filter(User.company_id == cid_uuid).all()
+        for u in emp_rows:
+            if (u.role or "") in ("super_admin",):
                 continue
+            p = u.profile or {}
             employees.append({
-                "uid":        doc.id,
-                "email":      d.get("email", ""),
-                "firstName":  d.get("first_name", ""),
-                "lastName":   d.get("last_name", ""),
-                "role":       d.get("role", "employee"),
-                "department": d.get("department"),
-                "isActive":   d.get("is_active", True),
+                "uid":        u.id,
+                "email":      u.email or "",
+                "firstName":  p.get("first_name", ""),
+                "lastName":   p.get("last_name", ""),
+                "role":       u.role or "employee",
+                "department": u.department,
+                "isActive":   bool(u.is_active),
             })
     except Exception as e:
         print(f"[admin_metrics] employee list error for {company_id}: {e}")
@@ -403,37 +421,36 @@ async def admin_get_company_detail(
     cost_30d = 0.0
     try:
         cutoff = datetime.now(timezone.utc) - timedelta(days=30)
-        usage_docs = (
-            db.collection("usage_logs")
-            .where("company_id", "==", company_id)
-            .where("timestamp", ">=", cutoff)
-            .stream()
+        usage_rows = (
+            db.query(UsageLog)
+            .filter(UsageLog.company_id == cid_uuid)
+            .filter(UsageLog.created_at >= cutoff)
+            .all()
         )
-        for doc in usage_docs:
-            d = doc.to_dict()
-            tokens_in_30d  += _safe_int(d.get("tokens_in"))
-            tokens_out_30d += _safe_int(d.get("tokens_out"))
-            cost_30d       += _safe_float(d.get("estimated_cost_usd"))
+        for u in usage_rows:
+            tokens_in_30d  += _safe_int(u.tokens_in)
+            tokens_out_30d += _safe_int(u.tokens_out)
+            cost_30d       += _safe_float(u.estimated_cost_usd)
     except Exception as e:
         print(f"[admin_metrics] usage 30d error for {company_id}: {e}")
 
     return CompanyDetail(
-        id=company_id,
-        name=cd.get("name", ""),
-        industry=cd.get("industry"),
-        size=cd.get("size"),
-        website=cd.get("website"),
-        planTier=creds.get("plan_tier") or cd.get("plan_tier"),
-        employeeCount=_safe_int(cd.get("employee_count")),
-        creditLimitUsd=_safe_float(creds.get("credit_limit_usd", 10.0)),
-        creditsConsumedMtd=_safe_float(creds.get("credits_consumed_mtd")),
-        creditsRemaining=_safe_float(creds.get("credits_remaining", 10.0)),
-        warningThresholdPct=_safe_float(creds.get("warning_threshold_pct", 80.0)),
-        alertStatus=creds.get("alert_status", "normal"),
-        totalLifetimeSpend=_safe_float(creds.get("total_lifetime_spend_usd")),
-        lastResetAt=_ts_to_iso(creds.get("last_reset_at")),
-        ownerId=cd.get("owner_id"),
-        createdAt=_ts_to_iso(cd.get("created_at")),
+        id=str(company.id),
+        name=company.name or "",
+        industry=s.get("industry"),
+        size=s.get("size"),
+        website=s.get("website"),
+        planTier=(creds.plan_tier if creds else None) or s.get("plan_tier"),
+        employeeCount=_safe_int(company.employee_count),
+        creditLimitUsd=_safe_float(creds.credit_limit_usd if creds else 10.0, 10.0),
+        creditsConsumedMtd=_safe_float(creds.credits_consumed_mtd if creds else 0),
+        creditsRemaining=_safe_float(creds.credits_remaining if creds else 10.0, 10.0),
+        warningThresholdPct=_safe_float(creds.warning_threshold_pct if creds else 80.0, 80.0),
+        alertStatus=(creds.alert_status if creds else None) or "normal",
+        totalLifetimeSpend=_safe_float(creds.total_lifetime_spend_usd if creds else 0),
+        lastResetAt=_ts_to_iso(creds.last_reset_at if creds else None),
+        ownerId=company.owner_id,
+        createdAt=_ts_to_iso(company.created_at),
         tokensIn30d=tokens_in_30d,
         tokensOut30d=tokens_out_30d,
         costUsd30d=round(cost_30d, 6),
@@ -451,15 +468,20 @@ async def admin_get_company_detail(
 async def admin_get_user_detail(
     uid: str,
     _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
-    user_doc = db.collection("users").document(uid).get()
-    if not user_doc.exists:
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
         raise HTTPException(404, "User not found.")
-    ud = user_doc.to_dict()
+
+    p = user.profile or {}
+
+    # Resolve company name via Company lookup if available
+    company_name: Optional[str] = p.get("company_name")
+    if user.company_id and not company_name:
+        company = db.query(Company).filter(Company.id == user.company_id).one_or_none()
+        if company is not None:
+            company_name = company.name
 
     # Aggregate all-time usage for this user
     total_in = total_out = total_calls = 0
@@ -467,17 +489,14 @@ async def admin_get_user_detail(
     feature_breakdown: Dict[str, Dict[str, Any]] = {}
 
     try:
-        usage_docs = (
-            db.collection("usage_logs")
-            .where("user_id", "==", uid)
-            .stream()
+        usage_rows: List[UsageLog] = (
+            db.query(UsageLog).filter(UsageLog.user_id == uid).all()
         )
-        for doc in usage_docs:
-            d = doc.to_dict()
-            tin   = _safe_int(d.get("tokens_in"))
-            tout  = _safe_int(d.get("tokens_out"))
-            cost  = _safe_float(d.get("estimated_cost_usd"))
-            feat  = d.get("feature", "unknown")
+        for u in usage_rows:
+            tin   = _safe_int(u.tokens_in)
+            tout  = _safe_int(u.tokens_out)
+            cost  = _safe_float(u.estimated_cost_usd)
+            feat  = u.feature or "unknown"
 
             total_in    += tin
             total_out   += tout
@@ -499,16 +518,16 @@ async def admin_get_user_detail(
 
     return UserDetail(
         uid=uid,
-        email=ud.get("email", ""),
-        firstName=ud.get("first_name", ""),
-        lastName=ud.get("last_name", ""),
-        role=ud.get("role", "employee"),
-        companyId=ud.get("company_id"),
-        companyName=ud.get("company_name"),
-        department=ud.get("department"),
-        isActive=ud.get("is_active", True),
-        lastActiveAt=_ts_to_iso(ud.get("last_active_at")),
-        createdAt=_ts_to_iso(ud.get("created_at") or ud.get("registered_at")),
+        email=user.email or "",
+        firstName=p.get("first_name", ""),
+        lastName=p.get("last_name", ""),
+        role=user.role or "employee",
+        companyId=str(user.company_id) if user.company_id else None,
+        companyName=company_name,
+        department=user.department,
+        isActive=bool(user.is_active),
+        lastActiveAt=_ts_to_iso(user.last_active_at),
+        createdAt=_ts_to_iso(user.created_at),
         totalTokensIn=total_in,
         totalTokensOut=total_out,
         totalCostUsd=round(total_cost, 6),
@@ -531,43 +550,42 @@ async def admin_usage_logs(
     page:       int            = Query(1, ge=1),
     limit:      int            = Query(50, ge=1, le=200),
     _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
     try:
-        query = db.collection("usage_logs").where("timestamp", ">=", cutoff)
+        q = db.query(UsageLog).filter(UsageLog.created_at >= cutoff)
         if company_id:
-            query = query.where("company_id", "==", company_id)
+            cid_uuid = _parse_company_uuid(company_id)
+            q = q.filter(UsageLog.company_id == cid_uuid)
         if user_id:
-            query = query.where("user_id", "==", user_id)
-        docs = list(query.stream())
+            q = q.filter(UsageLog.user_id == user_id)
+        rows: List[UsageLog] = q.all()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, f"usage_logs query failed: {e}")
 
     records: List[UsageRecord] = []
-    for doc in docs:
-        d = doc.to_dict()
-        if feature and d.get("feature") != feature:
+    for u in rows:
+        if feature and u.feature != feature:
             continue
         records.append(UsageRecord(
-            id=doc.id,
-            userId=d.get("user_id", ""),
-            companyId=d.get("company_id", ""),
-            feature=d.get("feature", ""),
-            model=d.get("model", ""),
-            provider=d.get("provider", ""),
-            tokensIn=_safe_int(d.get("tokens_in")),
-            tokensOut=_safe_int(d.get("tokens_out")),
-            totalTokens=_safe_int(d.get("total_tokens")),
-            estimatedCostUsd=_safe_float(d.get("estimated_cost_usd")),
-            latencyMs=_safe_int(d.get("latency_ms")),
-            success=bool(d.get("success", True)),
-            error=d.get("error"),
-            timestamp=_ts_to_iso(d.get("timestamp")),
+            id=str(u.id),
+            userId=u.user_id or "",
+            companyId=str(u.company_id) if u.company_id else "",
+            feature=u.feature or "",
+            model=u.model or "",
+            provider=u.provider or "",
+            tokensIn=_safe_int(u.tokens_in),
+            tokensOut=_safe_int(u.tokens_out),
+            totalTokens=_safe_int(u.total_tokens),
+            estimatedCostUsd=_safe_float(u.estimated_cost_usd),
+            latencyMs=_safe_int(u.latency_ms),
+            success=bool(u.success if u.success is not None else True),
+            error=u.error,
+            timestamp=_ts_to_iso(u.created_at),
         ))
 
     # Sort newest first
@@ -610,21 +628,17 @@ async def admin_credit_balances(
     page:         int           = Query(1, ge=1),
     limit:        int           = Query(50, ge=1, le=200),
     _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     try:
-        docs = list(db.collection("company_credits").stream())
+        rows: List[CompanyCredit] = db.query(CompanyCredit).all()
     except Exception as e:
         raise HTTPException(500, f"company_credits query failed: {e}")
 
     balances: List[CreditBalance] = []
-    for doc in docs:
-        d  = doc.to_dict()
-        pt = d.get("plan_tier", "free")
-        st = d.get("alert_status", "normal")
+    for cc in rows:
+        pt = cc.plan_tier or "free"
+        st = cc.alert_status or "normal"
 
         if alert_status and st != alert_status:
             continue
@@ -632,15 +646,15 @@ async def admin_credit_balances(
             continue
 
         balances.append(CreditBalance(
-            companyId=doc.id,
-            companyName=d.get("company_name", ""),
+            companyId=str(cc.company_id),
+            companyName=cc.company_name or "",
             planTier=pt,
-            creditLimitUsd=_safe_float(d.get("credit_limit_usd", 10.0)),
-            creditsConsumedMtd=_safe_float(d.get("credits_consumed_mtd")),
-            creditsRemaining=_safe_float(d.get("credits_remaining", 10.0)),
+            creditLimitUsd=_safe_float(cc.credit_limit_usd, 10.0),
+            creditsConsumedMtd=_safe_float(cc.credits_consumed_mtd),
+            creditsRemaining=_safe_float(cc.credits_remaining, 10.0),
             alertStatus=st,
-            totalLifetimeSpend=_safe_float(d.get("total_lifetime_spend_usd")),
-            lastResetAt=_ts_to_iso(d.get("last_reset_at")),
+            totalLifetimeSpend=_safe_float(cc.total_lifetime_spend_usd),
+            lastResetAt=_ts_to_iso(cc.last_reset_at),
         ))
 
     # Sort by consumed descending — most spend first
@@ -674,39 +688,38 @@ async def admin_audit_log(
     page:       int            = Query(1, ge=1),
     limit:      int            = Query(50, ge=1, le=200),
     _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
     try:
-        query = db.collection("audit_logs").where("timestamp", ">=", cutoff)
+        q = db.query(AuditLog).filter(AuditLog.created_at >= cutoff)
         if company_id:
-            query = query.where("company_id", "==", company_id)
+            cid_uuid = _parse_company_uuid(company_id)
+            q = q.filter(AuditLog.company_id == cid_uuid)
         if actor_uid:
-            query = query.where("actor_uid", "==", actor_uid)
-        docs = list(query.stream())
+            q = q.filter(AuditLog.actor_uid == actor_uid)
+        rows: List[AuditLog] = q.all()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, f"audit_logs query failed: {e}")
 
     entries: List[AuditEntry] = []
-    for doc in docs:
-        d = doc.to_dict()
-        if action and d.get("action") != action:
+    for a in rows:
+        if action and a.action != action:
             continue
         entries.append(AuditEntry(
-            id=doc.id,
-            actorUid=d.get("actor_uid", ""),
-            actorRole=d.get("actor_role", ""),
-            action=d.get("action", ""),
-            targetUid=d.get("target_uid"),
-            targetType=d.get("target_type", "user"),
-            companyId=d.get("company_id", ""),
-            metadata=d.get("metadata") or {},
-            timestamp=_ts_to_iso(d.get("timestamp")),
-            success=bool(d.get("success", True)),
+            id=str(a.id),
+            actorUid=a.actor_uid or "",
+            actorRole=a.actor_role or "",
+            action=a.action or "",
+            targetUid=a.target_uid,
+            targetType=a.target_type or "user",
+            companyId=str(a.company_id) if a.company_id else "",
+            metadata=a.audit_metadata or {},
+            timestamp=_ts_to_iso(a.created_at),
+            success=bool(a.success if a.success is not None else True),
         ))
 
     # Sort newest first
@@ -753,18 +766,29 @@ class UpdateChallengeRequest(BaseModel):
     endsAt:       Optional[str] = None
 
 
+def _parse_iso_datetime(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        # Accept "Z" suffix
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
 # ─── GET /admin/gamification/overview ────────────────────────────────────────
 
 @router.get(
     "/gamification/overview",
     summary="Platform-Wide Gamification Health",
 )
-async def admin_gamification_overview(_: dict = Depends(get_super_admin_user)):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
-    # All user_gamification docs
+async def admin_gamification_overview(
+    _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
+):
+    # All user_gamification rows
     total_players     = 0
     total_points      = 0
     total_levels      = 0
@@ -773,42 +797,42 @@ async def admin_gamification_overview(_: dict = Depends(get_super_admin_user)):
     company_names:    Dict[str, str]   = {}
 
     try:
-        for doc in db.collection("user_gamification").stream():
-            d  = doc.to_dict()
-            cid = d.get("company_id", "")
-            pts = _safe_int(d.get("total_points"))
-            lvl = _safe_int(d.get("level", 1))
+        for ug in db.query(UserGamification).all():
+            cid = str(ug.company_id) if ug.company_id else ""
+            pts = _safe_int(ug.points)
+            lvl = _safe_int(ug.level if ug.level is not None else 1, 1)
             total_players += 1
             total_points  += pts
             total_levels  += lvl
             company_points[cid] = company_points.get(cid, 0) + pts
             if cid not in company_names:
                 company_names[cid] = cid   # filled below
-            for badge in d.get("badges", []):
+            for badge in (ug.badges or []):
                 badge_counts[badge] = badge_counts.get(badge, 0) + 1
     except Exception as e:
         print(f"[admin_metrics] gamification overview error: {e}")
 
-    # Challenges
+    # Challenges (use WellnessChallenge; participation tracked via GamificationEvent)
     total_challenges       = 0
     active_challenges      = 0
     total_completions      = 0
     try:
-        for doc in db.collection("challenges").stream():
-            d = doc.to_dict()
+        for ch in db.query(WellnessChallenge).all():
             total_challenges += 1
-            if d.get("is_active", False):
+            if ch.is_active:
                 active_challenges += 1
     except Exception:
         pass
 
     try:
-        for doc in db.collection("user_challenge_progress").stream():
-            d = doc.to_dict()
-            if d.get("completed", False):
-                total_completions += 1
+        total_completions = (
+            db.query(func.count(GamificationEvent.id))
+            .filter(GamificationEvent.event_type == "challenge_completed")
+            .scalar()
+            or 0
+        )
     except Exception:
-        pass
+        total_completions = 0
 
     # Most engaged company by total points
     most_engaged = None
@@ -826,10 +850,9 @@ async def admin_gamification_overview(_: dict = Depends(get_super_admin_user)):
     points_by_event: Dict[str, int] = {}
     try:
         cutoff_30 = datetime.now(timezone.utc) - timedelta(days=30)
-        for doc in db.collection("gamification_events").where("created_at", ">=", cutoff_30).stream():
-            d      = doc.to_dict()
-            etype  = d.get("event_type", "unknown")
-            points = _safe_int(d.get("points"))
+        for ge in db.query(GamificationEvent).filter(GamificationEvent.created_at >= cutoff_30).all():
+            etype  = ge.event_type or "unknown"
+            points = _safe_int(ge.points)
             points_by_event[etype] = points_by_event.get(etype, 0) + points
     except Exception as e:
         print(f"[admin_metrics] gamification_events error: {e}")
@@ -842,7 +865,7 @@ async def admin_gamification_overview(_: dict = Depends(get_super_admin_user)):
         "badgeCounts":              badge_counts,
         "totalChallenges":          total_challenges,
         "activeChallenges":         active_challenges,
-        "totalChallengeCompletions": total_completions,
+        "totalChallengeCompletions": int(total_completions),
         "pointsByEventType30d":     points_by_event,
         "mostEngagedCompany":       most_engaged,
         "computedAt":               datetime.now(timezone.utc).isoformat(),
@@ -858,22 +881,20 @@ async def admin_gamification_overview(_: dict = Depends(get_super_admin_user)):
 async def admin_gamification_company(
     company_id: str,
     _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    cid_uuid = _parse_company_uuid(company_id)
 
-    gam_docs = []
     try:
-        gam_docs = list(
-            db.collection("user_gamification")
-            .where("company_id", "==", company_id)
-            .stream()
+        gam_rows: List[UserGamification] = (
+            db.query(UserGamification)
+            .filter(UserGamification.company_id == cid_uuid)
+            .all()
         )
     except Exception as e:
         raise HTTPException(500, f"user_gamification query failed: {e}")
 
-    if not gam_docs:
+    if not gam_rows:
         return {
             "companyId": company_id, "totalPlayers": 0,
             "activePlayers7d": 0, "avgPoints": 0.0, "avgLevel": 0.0,
@@ -887,38 +908,41 @@ async def admin_gamification_company(
     active_7d = 0
     badge_dist: Dict[str, int] = {}
 
-    for doc in gam_docs:
-        d = doc.to_dict()
-        total_pts    += _safe_int(d.get("total_points"))
-        total_lvl    += _safe_int(d.get("level", 1))
-        total_streak += _safe_int(d.get("current_streak"))
-        for badge in d.get("badges", []):
+    for ug in gam_rows:
+        total_pts    += _safe_int(ug.points)
+        total_lvl    += _safe_int(ug.level if ug.level is not None else 1, 1)
+        total_streak += _safe_int(ug.streak)
+        for badge in (ug.badges or []):
             badge_dist[badge] = badge_dist.get(badge, 0) + 1
-        # last_check_in used as proxy for recent activity
-        lci = d.get("last_check_in")
-        if lci and hasattr(lci, "timestamp"):
-            dt = datetime.fromtimestamp(lci.timestamp(), tz=timezone.utc)
-            if dt >= cutoff_7d:
-                active_7d += 1
+        # last_check_in (from extras JSONB) used as proxy for recent activity
+        extras = ug.extras or {}
+        lci = extras.get("last_check_in")
+        lci_dt = _parse_iso_datetime(lci) if isinstance(lci, str) else None
+        if lci_dt is None and isinstance(lci, datetime):
+            lci_dt = lci if lci.tzinfo else lci.replace(tzinfo=timezone.utc)
+        if lci_dt is not None and lci_dt >= cutoff_7d:
+            active_7d += 1
 
-    n = len(gam_docs)
+    n = len(gam_rows)
 
     # 7-day points trend from gamification_events
     points_trend_7d: List[int] = [0] * 7
     try:
-        for doc in (
-            db.collection("gamification_events")
-            .where("company_id", "==", company_id)
-            .where("created_at",  ">=", cutoff_7d)
-            .stream()
-        ):
-            d   = doc.to_dict()
-            ts  = d.get("created_at")
-            pts = _safe_int(d.get("points"))
-            if ts and hasattr(ts, "timestamp"):
-                day_idx = (now - datetime.fromtimestamp(ts.timestamp(), tz=timezone.utc)).days
-                if 0 <= day_idx < 7:
-                    points_trend_7d[6 - day_idx] += pts
+        events = (
+            db.query(GamificationEvent)
+            .filter(GamificationEvent.company_id == cid_uuid)
+            .filter(GamificationEvent.created_at >= cutoff_7d)
+            .all()
+        )
+        for ge in events:
+            ts = ge.created_at
+            if ts is None:
+                continue
+            ts_aware = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+            pts = _safe_int(ge.points)
+            day_idx = (now - ts_aware).days
+            if 0 <= day_idx < 7:
+                points_trend_7d[6 - day_idx] += pts
     except Exception as e:
         print(f"[admin_metrics] gamification trend error: {e}")
 
@@ -945,34 +969,41 @@ async def admin_gamification_company(
 async def admin_create_challenge(
     req: CreateChallengeRequest,
     admin: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    company_uuid: Optional[uuid.UUID] = None
+    if req.companyId:
+        company_uuid = _parse_company_uuid(req.companyId)
 
-    challenge_id = str(uuid.uuid4())
-    doc = {
-        "id":           challenge_id,
-        "title":        req.title,
-        "description":  req.description,
-        "type":         req.type,
-        "target":       req.target,
-        "points_reward": req.pointsReward,
-        "company_id":   req.companyId,     # None = platform-wide
-        "is_active":    True,
-        "starts_at":    req.startsAt,
-        "ends_at":      req.endsAt,
-        "created_by":   admin.get("id", ""),
-        "created_at":   SERVER_TIMESTAMP,
-        "updated_at":   SERVER_TIMESTAMP,
-    }
+    starts_at_dt = _parse_iso_datetime(req.startsAt)
+    ends_at_dt = _parse_iso_datetime(req.endsAt)
+
+    challenge = WellnessChallenge(
+        id=uuid.uuid4(),
+        company_id=company_uuid,
+        title=req.title,
+        description=req.description,
+        is_active=True,
+        data={
+            "type":          req.type,
+            "target":        req.target,
+            "points_reward": req.pointsReward,
+            "starts_at":     req.startsAt,
+            "ends_at":       req.endsAt,
+            "created_by":    admin.get("id", ""),
+        },
+        starts_at=starts_at_dt,
+        ends_at=ends_at_dt,
+    )
 
     try:
-        db.collection("challenges").document(challenge_id).set(doc)
+        db.add(challenge)
+        db.commit()
     except Exception as e:
+        db.rollback()
         raise HTTPException(500, f"Failed to create challenge: {e}")
 
-    return {"success": True, "challengeId": challenge_id, "message": "Challenge created."}
+    return {"success": True, "challengeId": str(challenge.id), "message": "Challenge created."}
 
 
 # ─── GET /admin/challenges ────────────────────────────────────────────────────
@@ -987,36 +1018,38 @@ async def admin_list_challenges(
     page:        int            = Query(1, ge=1),
     limit:       int            = Query(20, ge=1, le=100),
     _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     try:
-        docs = list(db.collection("challenges").stream())
+        rows: List[WellnessChallenge] = db.query(WellnessChallenge).all()
     except Exception as e:
         raise HTTPException(500, f"challenges query failed: {e}")
 
+    # Optional filter for company_id (string compare on stringified UUID; None == platform-wide)
+    filter_cid_uuid: Optional[uuid.UUID] = None
+    if company_id is not None:
+        filter_cid_uuid = _parse_company_uuid(company_id)
+
     results = []
-    for doc in docs:
-        d = doc.to_dict()
-        if company_id is not None and d.get("company_id") != company_id:
+    for ch in rows:
+        if company_id is not None and ch.company_id != filter_cid_uuid:
             continue
-        if is_active is not None and bool(d.get("is_active")) != is_active:
+        if is_active is not None and bool(ch.is_active) != is_active:
             continue
+        data = ch.data or {}
         results.append({
-            "id":           doc.id,
-            "title":        d.get("title"),
-            "description":  d.get("description"),
-            "type":         d.get("type"),
-            "target":       d.get("target"),
-            "pointsReward": d.get("points_reward"),
-            "companyId":    d.get("company_id"),
-            "isActive":     d.get("is_active", True),
-            "startsAt":     d.get("starts_at"),
-            "endsAt":       d.get("ends_at"),
-            "createdBy":    d.get("created_by"),
-            "createdAt":    _ts_to_iso(d.get("created_at")),
+            "id":           str(ch.id),
+            "title":        ch.title,
+            "description":  ch.description,
+            "type":         data.get("type"),
+            "target":       data.get("target"),
+            "pointsReward": data.get("points_reward"),
+            "companyId":    str(ch.company_id) if ch.company_id else None,
+            "isActive":     bool(ch.is_active),
+            "startsAt":     data.get("starts_at") or _ts_to_iso(ch.starts_at),
+            "endsAt":       data.get("ends_at") or _ts_to_iso(ch.ends_at),
+            "createdBy":    data.get("created_by"),
+            "createdAt":    _ts_to_iso(ch.created_at),
         })
 
     total  = len(results)
@@ -1043,37 +1076,57 @@ async def admin_update_challenge(
     challenge_id: str,
     req: UpdateChallengeRequest,
     _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    ch_uuid = _parse_challenge_uuid(challenge_id)
 
-    doc = db.collection("challenges").document(challenge_id).get()
-    if not doc.exists:
+    challenge = db.query(WellnessChallenge).filter(WellnessChallenge.id == ch_uuid).one_or_none()
+    if challenge is None:
         raise HTTPException(404, "Challenge not found.")
 
-    updates: Dict[str, Any] = {"updated_at": SERVER_TIMESTAMP}
-    updated_fields = []
+    updated_fields: List[str] = []
 
-    field_map = {
-        "title":        "title",
-        "description":  "description",
-        "target":       "target",
-        "pointsReward": "points_reward",
-        "isActive":     "is_active",
-        "startsAt":     "starts_at",
-        "endsAt":       "ends_at",
-    }
-    for req_field, db_field in field_map.items():
-        val = getattr(req, req_field, None)
-        if val is not None:
-            updates[db_field] = val
-            updated_fields.append(req_field)
+    # Direct columns
+    if req.title is not None:
+        challenge.title = req.title
+        updated_fields.append("title")
+    if req.description is not None:
+        challenge.description = req.description
+        updated_fields.append("description")
+    if req.isActive is not None:
+        challenge.is_active = req.isActive
+        updated_fields.append("isActive")
+    if req.startsAt is not None:
+        starts_at_dt = _parse_iso_datetime(req.startsAt)
+        challenge.starts_at = starts_at_dt
+        updated_fields.append("startsAt")
+    if req.endsAt is not None:
+        ends_at_dt = _parse_iso_datetime(req.endsAt)
+        challenge.ends_at = ends_at_dt
+        updated_fields.append("endsAt")
 
-    if len(updates) == 1:
+    # JSONB extras (data)
+    data = dict(challenge.data or {})
+    if req.target is not None:
+        data["target"] = req.target
+        updated_fields.append("target")
+    if req.pointsReward is not None:
+        data["points_reward"] = req.pointsReward
+        updated_fields.append("pointsReward")
+    if req.startsAt is not None:
+        data["starts_at"] = req.startsAt
+    if req.endsAt is not None:
+        data["ends_at"] = req.endsAt
+    challenge.data = data
+
+    if not updated_fields:
         raise HTTPException(400, "No fields to update.")
 
-    db.collection("challenges").document(challenge_id).update(updates)
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Failed to update challenge: {e}")
 
     return {"success": True, "challengeId": challenge_id, "updatedFields": updated_fields}
 
@@ -1087,36 +1140,64 @@ async def admin_update_challenge(
 async def admin_challenge_stats(
     challenge_id: str,
     _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    ch_uuid = _parse_challenge_uuid(challenge_id)
 
-    challenge_doc = db.collection("challenges").document(challenge_id).get()
-    if not challenge_doc.exists:
+    challenge = db.query(WellnessChallenge).filter(WellnessChallenge.id == ch_uuid).one_or_none()
+    if challenge is None:
         raise HTTPException(404, "Challenge not found.")
-    cd = challenge_doc.to_dict()
+    cd = challenge.data or {}
 
     participants    = 0
     completions     = 0
     company_breakdown: Dict[str, Dict[str, int]] = {}
 
+    # Use GamificationEvent records as participation proxy:
+    #   event_type in ("challenge_joined", "challenge_completed")
+    #   event_metadata.challenge_id == challenge_id
     try:
-        for doc in (
-            db.collection("user_challenge_progress")
-            .where("challenge_id", "==", challenge_id)
-            .stream()
-        ):
-            d   = doc.to_dict()
-            cid = d.get("company_id", "unknown")
-            participants += 1
-            if d.get("completed", False):
-                completions += 1
+        events = (
+            db.query(GamificationEvent)
+            .filter(
+                GamificationEvent.event_type.in_(
+                    ["challenge_joined", "challenge_completed"]
+                )
+            )
+            .all()
+        )
+        # Track unique participants by user
+        seen_participants: set[str] = set()
+        seen_completions: set[str] = set()
+        company_seen_participants: Dict[str, set[str]] = {}
+        company_seen_completions: Dict[str, set[str]] = {}
+
+        for ge in events:
+            meta = ge.event_metadata or {}
+            if str(meta.get("challenge_id", "")) != challenge_id:
+                continue
+            cid = str(ge.company_id) if ge.company_id else "unknown"
+            uid = ge.user_id
+
             if cid not in company_breakdown:
                 company_breakdown[cid] = {"participants": 0, "completions": 0}
-            company_breakdown[cid]["participants"] += 1
-            if d.get("completed", False):
-                company_breakdown[cid]["completions"] += 1
+                company_seen_participants[cid] = set()
+                company_seen_completions[cid] = set()
+
+            if uid not in seen_participants:
+                seen_participants.add(uid)
+                participants += 1
+            if uid not in company_seen_participants[cid]:
+                company_seen_participants[cid].add(uid)
+                company_breakdown[cid]["participants"] += 1
+
+            if ge.event_type == "challenge_completed":
+                if uid not in seen_completions:
+                    seen_completions.add(uid)
+                    completions += 1
+                if uid not in company_seen_completions[cid]:
+                    company_seen_completions[cid].add(uid)
+                    company_breakdown[cid]["completions"] += 1
     except Exception as e:
         print(f"[admin_metrics] challenge stats error: {e}")
 
@@ -1124,11 +1205,11 @@ async def admin_challenge_stats(
 
     return {
         "challengeId":      challenge_id,
-        "title":            cd.get("title"),
+        "title":            challenge.title,
         "type":             cd.get("type"),
         "target":           cd.get("target"),
         "pointsReward":     cd.get("points_reward"),
-        "isActive":         cd.get("is_active", True),
+        "isActive":         bool(challenge.is_active),
         "participants":     participants,
         "completions":      completions,
         "completionRatePct": completion_rate,

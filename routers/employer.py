@@ -8,27 +8,34 @@ Employer CRUD — Full profile & company management
   GET    /api/employer/company/stats    → Company summary stats (headcount, roles, depts)
   DELETE /api/employer/account          → Permanently delete employer account + company
                                           ⚠  Requires confirmation_phrase in body
-  POST   /api/employer/change-password  → Change own password via Firebase Auth REST API
+  POST   /api/employer/change-password  → Change own password via bcrypt verify + Postgres update
 
 All endpoints require JWT with role == employer (only the account owner).
 HR users can read profile/company but cannot mutate or delete.
 """
 
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from firebase_admin import auth as fb_auth, firestore as admin_firestore
-from firebase_config import get_db, firebaseConfig
-from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 from pydantic import BaseModel, EmailStr
+from sqlalchemy import func
+from sqlalchemy.orm import Session
 
+from auth.password import hash_password, verify_password
+from db.models import (
+    ChatSession,
+    Company,
+    MentalHealthReport,
+    PhysicalHealthCheckin,
+    UsageLog,
+    User,
+    UserGamification,
+)
+from db.session import get_session
 from routers.auth import get_current_user, get_employer_user
 
 router = APIRouter(prefix="/employer", tags=["Employer CRUD"])
-
-_Increment = admin_firestore.firestore.Increment
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -49,6 +56,27 @@ def _ts_to_iso(ts) -> Optional[str]:
     return str(ts)
 
 
+def _safe_int(val, default: int = 0) -> int:
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_dt(ts) -> Optional[datetime]:
+    """Coerce a timestamp-ish value to an aware UTC datetime."""
+    if ts is None:
+        return None
+    try:
+        if hasattr(ts, "timestamp") and not isinstance(ts, datetime):
+            return datetime.fromtimestamp(ts.timestamp(), tz=timezone.utc)
+        if isinstance(ts, datetime):
+            return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+    return None
+
+
 def _require_owner(employer: dict, expected_role: str = "employer") -> None:
     """Raise 403 if the caller isn't the account owner (role == employer)."""
     if employer.get("role") != expected_role:
@@ -59,6 +87,26 @@ def _require_owner(employer: dict, expected_role: str = "employer") -> None:
                 f"Your role: '{employer.get('role', 'unknown')}'."
             ),
         )
+
+
+def _company_to_response(company: Company) -> "CompanyResponse":
+    """Map a Company ORM instance to CompanyResponse using settings JSONB for extended fields."""
+    s = company.settings or {}
+    return CompanyResponse(
+        id=str(company.id),
+        name=company.name,
+        industry=s.get("industry"),
+        size=s.get("size"),
+        ownerId=company.owner_id or "",
+        employeeCount=company.employee_count,
+        website=s.get("website"),
+        address=s.get("address"),
+        phone=s.get("phone"),
+        description=s.get("description"),
+        logoUrl=s.get("logo_url"),
+        createdAt=_ts_to_iso(company.created_at),
+        updatedAt=_ts_to_iso(company.updated_at),
+    )
 
 
 # ─── Schemas ─────────────────────────────────────────────────────────────────
@@ -151,32 +199,36 @@ class MutationResponse(BaseModel):
     summary="Get Employer Profile",
     description="Returns the caller's full employer profile, with embedded company document.",
 )
-async def get_employer_profile(employer: dict = Depends(get_employer_user)):
-    db = get_db()
-    company_id = employer.get("company_id", "")
+async def get_employer_profile(
+    employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
+):
+    company_id_str = employer.get("company_id", "")
     company_doc = None
 
-    if db and company_id:
+    if company_id_str:
         try:
-            cdoc = db.collection("companies").document(company_id).get()
-            if cdoc.exists:
-                raw = cdoc.to_dict()
+            import uuid as _uuid
+            cid = _uuid.UUID(company_id_str)
+            company = db.query(Company).filter(Company.id == cid).one_or_none()
+            if company is not None:
+                s = company.settings or {}
                 company_doc = {
-                    "id":            raw.get("id", company_id),
-                    "name":          raw.get("name"),
-                    "industry":      raw.get("industry"),
-                    "size":          raw.get("size"),
-                    "ownerId":       raw.get("owner_id"),
-                    "employeeCount": raw.get("employee_count", 0),
-                    "website":       raw.get("website"),
-                    "address":       raw.get("address"),
-                    "phone":         raw.get("phone"),
-                    "description":   raw.get("description"),
-                    "logoUrl":       raw.get("logo_url"),
-                    "createdAt":     _ts_to_iso(raw.get("created_at")),
-                    "updatedAt":     _ts_to_iso(raw.get("updated_at")),
+                    "id":            str(company.id),
+                    "name":          company.name,
+                    "industry":      s.get("industry"),
+                    "size":          s.get("size"),
+                    "ownerId":       company.owner_id,
+                    "employeeCount": company.employee_count,
+                    "website":       s.get("website"),
+                    "address":       s.get("address"),
+                    "phone":         s.get("phone"),
+                    "description":   s.get("description"),
+                    "logoUrl":       s.get("logo_url"),
+                    "createdAt":     _ts_to_iso(company.created_at),
+                    "updatedAt":     _ts_to_iso(company.updated_at),
                 }
-        except Exception as e:
+        except (ValueError, Exception) as e:
             print(f"[employer] company fetch error: {e}")
 
     perms = {k: employer.get(k, False) for k in (
@@ -194,7 +246,7 @@ async def get_employer_profile(employer: dict = Depends(get_employer_user)):
         role=employer.get("role", "employer"),
         jobTitle=employer.get("job_title"),
         phone=employer.get("phone"),
-        companyId=company_id,
+        companyId=company_id_str,
         companyName=employer.get("company_name", ""),
         isActive=employer.get("is_active", True),
         hierarchyLevel=employer.get("hierarchy_level", 0),
@@ -216,14 +268,13 @@ async def get_employer_profile(employer: dict = Depends(get_employer_user)):
 async def update_employer_profile(
     req: UpdateEmployerProfileRequest,
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
     _require_owner(employer)
     uid = employer.get("id")
-    db  = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
 
-    updates: Dict[str, Any] = {"updated_at": SERVER_TIMESTAMP}
+    # Build the profile JSONB patch — only include fields that were provided
+    profile_updates: Dict[str, Any] = {}
     updated_fields: List[str] = []
 
     field_map = {
@@ -232,26 +283,29 @@ async def update_employer_profile(
         "phone":     "phone",
         "jobTitle":  "job_title",
     }
-    for req_field, db_field in field_map.items():
+    for req_field, profile_key in field_map.items():
         val = getattr(req, req_field, None)
         if val is not None:
-            updates[db_field] = val
+            profile_updates[profile_key] = val
             updated_fields.append(req_field)
 
-    if len(updates) == 1:
+    if not profile_updates:
         raise HTTPException(400, "No valid fields provided to update.")
 
     # Rebuild display_name if name changed
-    if "first_name" in updates or "last_name" in updates:
-        fn = updates.get("first_name", employer.get("first_name", ""))
-        ln = updates.get("last_name",  employer.get("last_name",  ""))
-        updates["display_name"] = f"{fn} {ln}"
-        try:
-            fb_auth.update_user(uid, display_name=updates["display_name"])
-        except Exception as e:
-            print(f"[employer] Firebase display_name sync error: {e}")
+    if "first_name" in profile_updates or "last_name" in profile_updates:
+        fn = profile_updates.get("first_name", employer.get("first_name", ""))
+        ln = profile_updates.get("last_name",  employer.get("last_name",  ""))
+        profile_updates["display_name"] = f"{fn} {ln}"
 
-    db.collection("users").document(uid).update(updates)
+    # Merge the new values into the existing profile JSONB
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
+        raise HTTPException(404, "User not found.")
+    merged = dict(user.profile or {})
+    merged.update(profile_updates)
+    user.profile = merged
+    db.commit()
 
     return MutationResponse(
         success=True,
@@ -268,35 +322,25 @@ async def update_employer_profile(
     summary="Get Company Details",
     description="Returns the full company document for the employer's company.",
 )
-async def get_company(employer: dict = Depends(get_employer_user)):
-    company_id = employer.get("company_id")
-    if not company_id:
+async def get_company(
+    employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
+):
+    company_id_str = employer.get("company_id")
+    if not company_id_str:
         raise HTTPException(404, "No company associated with this account.")
 
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    import uuid as _uuid
+    try:
+        cid = _uuid.UUID(company_id_str)
+    except ValueError:
+        raise HTTPException(400, "Invalid company ID.")
 
-    cdoc = db.collection("companies").document(company_id).get()
-    if not cdoc.exists:
+    company = db.query(Company).filter(Company.id == cid).one_or_none()
+    if company is None:
         raise HTTPException(404, "Company not found.")
 
-    raw = cdoc.to_dict()
-    return CompanyResponse(
-        id=raw.get("id", company_id),
-        name=raw.get("name", ""),
-        industry=raw.get("industry"),
-        size=raw.get("size"),
-        ownerId=raw.get("owner_id", ""),
-        employeeCount=raw.get("employee_count", 0),
-        website=raw.get("website"),
-        address=raw.get("address"),
-        phone=raw.get("phone"),
-        description=raw.get("description"),
-        logoUrl=raw.get("logo_url"),
-        createdAt=_ts_to_iso(raw.get("created_at")),
-        updatedAt=_ts_to_iso(raw.get("updated_at")),
-    )
+    return _company_to_response(company)
 
 
 # ─── PATCH /employer/company ──────────────────────────────────────────────────
@@ -313,25 +357,32 @@ async def get_company(employer: dict = Depends(get_employer_user)):
 async def update_company(
     req: UpdateCompanyRequest,
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
     _require_owner(employer)
-    company_id = employer.get("company_id")
-    if not company_id:
+    company_id_str = employer.get("company_id")
+    if not company_id_str:
         raise HTTPException(400, "Employer has no associated company_id.")
 
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    import uuid as _uuid
+    try:
+        cid = _uuid.UUID(company_id_str)
+    except ValueError:
+        raise HTTPException(400, "Invalid company ID.")
 
-    cdoc = db.collection("companies").document(company_id).get()
-    if not cdoc.exists:
+    company = db.query(Company).filter(Company.id == cid).one_or_none()
+    if company is None:
         raise HTTPException(404, "Company document not found.")
 
-    updates: Dict[str, Any] = {"updated_at": SERVER_TIMESTAMP}
     updated_fields: List[str] = []
 
-    field_map = {
-        "name":        "name",
+    # Top-level column: name
+    if req.name is not None:
+        company.name = req.name
+        updated_fields.append("name")
+
+    # Extended fields stored in settings JSONB
+    settings_map = {
         "industry":    "industry",
         "size":        "size",
         "website":     "website",
@@ -340,27 +391,18 @@ async def update_company(
         "description": "description",
         "logoUrl":     "logo_url",
     }
-    for req_field, db_field in field_map.items():
+    new_settings = dict(company.settings or {})
+    for req_field, settings_key in settings_map.items():
         val = getattr(req, req_field, None)
         if val is not None:
-            updates[db_field] = val
+            new_settings[settings_key] = val
             updated_fields.append(req_field)
 
-    if len(updates) == 1:
+    if not updated_fields:
         raise HTTPException(400, "No valid fields provided to update.")
 
-    db.collection("companies").document(company_id).update(updates)
-
-    # If name changed, sync to employer user profile too
-    if "name" in updates:
-        uid = employer.get("id")
-        try:
-            db.collection("users").document(uid).update({
-                "company_name": updates["name"],
-                "updated_at":   SERVER_TIMESTAMP,
-            })
-        except Exception as e:
-            print(f"[employer] company_name sync to user failed: {e}")
+    company.settings = new_settings
+    db.commit()
 
     return MutationResponse(
         success=True,
@@ -380,47 +422,61 @@ async def update_company(
         "department breakdown, and recent joins (last 30 days) for the employer's company."
     ),
 )
-async def get_company_stats(employer: dict = Depends(get_employer_user)):
-    company_id = employer.get("company_id")
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+async def get_company_stats(
+    employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
+):
+    company_id_str = employer.get("company_id")
+
+    import uuid as _uuid
+    if not company_id_str:
+        raise HTTPException(400, "Employer has no associated company_id.")
+    try:
+        cid = _uuid.UUID(company_id_str)
+    except ValueError:
+        raise HTTPException(400, "Invalid company ID.")
 
     try:
-        docs = db.collection("users").where("company_id", "==", company_id).stream()
+        users = (
+            db.query(User)
+            .filter(User.company_id == cid)
+            .all()
+        )
     except Exception as e:
         raise HTTPException(500, f"Database query failed: {e}")
 
     now = datetime.now(timezone.utc)
-    thirty_days_ago_ts = now.timestamp() - (30 * 86400)
+    thirty_days_ago = now - timedelta(days=30)
 
     total = active = inactive = recent_joins = 0
     roles: Dict[str, int] = {}
     depts: Dict[str, int] = {}
 
-    for doc in docs:
-        d = doc.to_dict()
-        if d.get("role") == "employer":
+    for user in users:
+        if user.role == "employer":
             continue   # don't count the owner in employee stats
         total += 1
-        if d.get("is_active", True):
+        if user.is_active:
             active += 1
         else:
             inactive += 1
 
-        role = d.get("role", "unknown")
+        role = user.role or "unknown"
         roles[role] = roles.get(role, 0) + 1
 
-        dept = d.get("department") or "Unassigned"
+        dept = user.department or "Unassigned"
         depts[dept] = depts.get(dept, 0) + 1
 
-        created_ts = d.get("created_at")
-        if created_ts and hasattr(created_ts, "timestamp"):
-            if created_ts.timestamp() >= thirty_days_ago_ts:
+        created_at = user.created_at
+        if created_at is not None:
+            # Ensure timezone-aware comparison
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            if created_at >= thirty_days_ago:
                 recent_joins += 1
 
     return CompanyStatsResponse(
-        companyId=company_id,
+        companyId=company_id_str,
         totalEmployees=total,
         activeEmployees=active,
         inactiveEmployees=inactive,
@@ -438,13 +494,14 @@ async def get_company_stats(employer: dict = Depends(get_employer_user)):
     response_model=MutationResponse,
     summary="Change Employer Password",
     description=(
-        "Re-authenticates via Firebase REST API, then updates the password. "
+        "Re-authenticates via bcrypt, then updates the password in Postgres. "
         "New password must be at least 8 characters."
     ),
 )
 async def change_password(
     req: ChangePasswordRequest,
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
     _require_owner(employer)
 
@@ -454,30 +511,17 @@ async def change_password(
     if req.current_password == req.new_password:
         raise HTTPException(400, "New password must be different from the current password.")
 
-    api_key = firebaseConfig.get("apiKey")
-    if not api_key:
-        raise HTTPException(500, "Server misconfiguration: Missing Firebase API Key.")
+    uid = employer.get("id")
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
+        raise HTTPException(404, "User not found.")
 
-    email = employer.get("email", "")
-
-    # Step 1: Re-authenticate with current password
-    verify_url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={api_key}"
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(verify_url, json={
-            "email":             email,
-            "password":          req.current_password,
-            "returnSecureToken": False,
-        })
-
-    if resp.status_code != 200:
+    # Re-authenticate: verify current password against stored hash
+    if user.password_hash is None or not verify_password(req.current_password, user.password_hash):
         raise HTTPException(401, "Current password is incorrect.")
 
-    # Step 2: Update password in Firebase Auth
-    uid = employer.get("id")
-    try:
-        fb_auth.update_user(uid, password=req.new_password)
-    except Exception as e:
-        raise HTTPException(500, f"Password update failed: {e}")
+    user.password_hash = hash_password(req.new_password)
+    db.commit()
 
     return MutationResponse(
         success=True,
@@ -492,14 +536,15 @@ async def change_password(
     response_model=MutationResponse,
     summary="Delete Employer Account",
     description=(
-        "⚠️ **Irreversible.** Permanently deletes the employer's Firebase Auth account, "
-        "user profile, and company document. All employee accounts remain intact. "
+        "**Irreversible.** Permanently deletes the employer's Postgres user row "
+        "and company document. Employee company_id FKs are SET NULL on cascade. "
         "Requires `confirmation_phrase = 'DELETE MY ACCOUNT'` and the current `password`."
     ),
 )
 async def delete_employer_account(
     req: DeleteAccountRequest,
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
     _require_owner(employer)
 
@@ -509,57 +554,28 @@ async def delete_employer_account(
             "Confirmation phrase must be exactly: DELETE MY ACCOUNT",
         )
 
-    # Re-authenticate before destructive action
-    api_key = firebaseConfig.get("apiKey")
-    if not api_key:
-        raise HTTPException(500, "Server misconfiguration: Missing Firebase API Key.")
+    uid = employer.get("id")
+    company_id_str = employer.get("company_id")
 
-    email = employer.get("email", "")
-    verify_url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={api_key}"
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(verify_url, json={
-            "email":             email,
-            "password":          req.password,
-            "returnSecureToken": False,
-        })
-
-    if resp.status_code != 200:
+    # Re-authenticate: verify password before destructive action
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
+        raise HTTPException(404, "User not found.")
+    if user.password_hash is None or not verify_password(req.password, user.password_hash):
         raise HTTPException(401, "Password is incorrect. Account deletion aborted.")
 
-    uid        = employer.get("id")
-    company_id = employer.get("company_id")
-    db         = get_db()
-
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
-    errors = []
-
-    # 1. Delete Firestore user profile
-    try:
-        db.collection("users").document(uid).delete()
-    except Exception as e:
-        errors.append(f"user_profile: {e}")
-
-    # 2. Delete Firestore company document
-    if company_id:
+    # 1. Delete company document (SET NULL cascade handles users.company_id)
+    if company_id_str:
+        import uuid as _uuid
         try:
-            db.collection("companies").document(company_id).delete()
+            cid = _uuid.UUID(company_id_str)
+            db.query(Company).filter(Company.id == cid).delete()
         except Exception as e:
-            errors.append(f"company: {e}")
+            print(f"[employer] Company deletion error for {company_id_str}: {e}")
 
-    # 3. Delete Firebase Auth account
-    try:
-        fb_auth.delete_user(uid)
-    except Exception as e:
-        errors.append(f"firebase_auth: {e}")
-
-    if errors:
-        print(f"[employer] Partial deletion errors for {uid}: {errors}")
-        raise HTTPException(
-            500,
-            f"Account partially deleted. Manual cleanup may be needed: {errors}",
-        )
+    # 2. Delete user row (ON DELETE CASCADE handles refresh_tokens, sessions, check_ins)
+    db.query(User).filter(User.id == uid).delete()
+    db.commit()
 
     return MutationResponse(
         success=True,
@@ -586,38 +602,51 @@ async def team_usage(
     page:       int            = Query(1, ge=1),
     limit:      int            = Query(20, ge=1, le=100),
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
-    company_id = employer.get("company_id")
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    company_id_str = employer.get("company_id")
+    if not company_id_str:
+        raise HTTPException(400, "Employer has no associated company_id.")
+
+    import uuid as _uuid
+    try:
+        cid = _uuid.UUID(company_id_str)
+    except ValueError:
+        raise HTTPException(400, "Invalid company ID.")
 
     now    = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=days)
 
     # ── 1. All active employees in this company ───────────────────────────
     try:
-        emp_docs = list(
-            db.collection("users")
-            .where("company_id", "==", company_id)
-            .where("is_active",  "==", True)
-            .stream()
+        emp_rows = (
+            db.query(User)
+            .filter(User.company_id == cid, User.is_active.is_(True))
+            .all()
         )
     except Exception as e:
         raise HTTPException(500, f"users query failed: {e}")
 
     employees: Dict[str, dict] = {}
-    for doc in emp_docs:
-        d = doc.to_dict()
-        if d.get("role") in ("employer", "super_admin"):
+    for u in emp_rows:
+        if u.role in ("employer", "super_admin"):
             continue
-        if department and (d.get("department") or "").lower() != department.lower():
+        if department and (u.department or "").lower() != department.lower():
             continue
-        employees[doc.id] = d
+        p = u.profile or {}
+        employees[u.id] = {
+            "id":              u.id,
+            "first_name":      p.get("first_name", ""),
+            "last_name":       p.get("last_name", ""),
+            "department":      u.department,
+            "position":        p.get("position"),
+            "role":            u.role or "employee",
+            "last_active_at":  u.last_active_at,
+        }
 
     if not employees:
         return {
-            "companyId": company_id, "windowDays": days,
+            "companyId": company_id_str, "windowDays": days,
             "employees": [], "total": 0, "page": page, "limit": limit,
             "totalPages": 1, "hasNext": False, "hasPrev": False,
             "summary": {
@@ -627,45 +656,58 @@ async def team_usage(
             },
         }
 
-    # ── 2. Batch-fetch activity data (all company-scoped, single query each) ──
+    company_user_ids = list(employees.keys())
 
-    session_counts:  Dict[str, int] = {}
+    # ── 2. Batch-fetch activity data ──────────────────────────────────────
+
+    # Chat sessions: ChatSession has no company_id column → filter by user_id
+    session_counts: Dict[str, int] = {}
     try:
-        for doc in (
-            db.collection("chat_sessions")
-            .where("company_id", "==", company_id)
-            .where("started_at", ">=", cutoff)
-            .stream()
-        ):
-            uid = doc.to_dict().get("user_id", "")
+        chat_rows = (
+            db.query(ChatSession)
+            .filter(
+                ChatSession.user_id.in_(company_user_ids),
+                ChatSession.created_at >= cutoff,
+            )
+            .all()
+        )
+        for cs in chat_rows:
+            uid = cs.user_id or ""
             if uid:
                 session_counts[uid] = session_counts.get(uid, 0) + 1
     except Exception as e:
         print(f"[team_usage] chat_sessions error: {e}")
 
+    # Mental health reports (counts as wellness check-ins activity)
     checkin_counts: Dict[str, int] = {}
     try:
-        for doc in (
-            db.collection("check_ins")
-            .where("company_id", "==", company_id)
-            .where("created_at", ">=", cutoff)
-            .stream()
-        ):
-            uid = doc.to_dict().get("user_id", "")
+        mh_rows = (
+            db.query(MentalHealthReport)
+            .filter(
+                MentalHealthReport.company_id == cid,
+                MentalHealthReport.generated_at >= cutoff,
+            )
+            .all()
+        )
+        for r in mh_rows:
+            uid = r.user_id or ""
             if uid:
                 checkin_counts[uid] = checkin_counts.get(uid, 0) + 1
     except Exception as e:
-        print(f"[team_usage] check_ins error: {e}")
+        print(f"[team_usage] mental_health_reports error: {e}")
 
     physical_counts: Dict[str, int] = {}
     try:
-        for doc in (
-            db.collection("physical_health_checkins")
-            .where("company_id", "==", company_id)
-            .where("created_at", ">=", cutoff)
-            .stream()
-        ):
-            uid = doc.to_dict().get("user_id", "")
+        ph_rows = (
+            db.query(PhysicalHealthCheckin)
+            .filter(
+                PhysicalHealthCheckin.company_id == cid,
+                PhysicalHealthCheckin.created_at >= cutoff,
+            )
+            .all()
+        )
+        for r in ph_rows:
+            uid = r.user_id or ""
             if uid:
                 physical_counts[uid] = physical_counts.get(uid, 0) + 1
     except Exception as e:
@@ -674,15 +716,17 @@ async def team_usage(
     # Features used — privacy-safe: feature names only, no content/cost
     features_used: Dict[str, set] = {}
     try:
-        for doc in (
-            db.collection("usage_logs")
-            .where("company_id", "==", company_id)
-            .where("timestamp",  ">=", cutoff)
-            .stream()
-        ):
-            d    = doc.to_dict()
-            uid  = d.get("user_id", "")
-            feat = d.get("feature", "")
+        usage_rows = (
+            db.query(UsageLog)
+            .filter(
+                UsageLog.company_id == cid,
+                UsageLog.created_at >= cutoff,
+            )
+            .all()
+        )
+        for r in usage_rows:
+            uid  = r.user_id or ""
+            feat = r.feature or ""
             if uid and feat:
                 if uid not in features_used:
                     features_used[uid] = set()
@@ -693,50 +737,41 @@ async def team_usage(
     # Gamification — current state, no time filter
     gam_map: Dict[str, dict] = {}
     try:
-        for doc in (
-            db.collection("user_gamification")
-            .where("company_id", "==", company_id)
-            .stream()
-        ):
-            d   = doc.to_dict()
-            uid = d.get("employee_id", "")
+        gam_rows = (
+            db.query(UserGamification)
+            .filter(UserGamification.company_id == cid)
+            .all()
+        )
+        for g in gam_rows:
+            uid = g.user_id or ""
             if uid:
-                gam_map[uid] = d
+                extras = g.extras or {}
+                gam_map[uid] = {
+                    "total_points":    g.points,
+                    "level":           g.level,
+                    "current_streak":  g.streak,
+                    "last_check_in":   extras.get("last_check_in"),
+                    "badges":          list(g.badges or []),
+                }
     except Exception as e:
         print(f"[team_usage] user_gamification error: {e}")
 
     # ── 3. Per-employee helpers ───────────────────────────────────────────
 
     def _activity_status(last_active_at) -> str:
-        if last_active_at is None:
+        dt = _to_dt(last_active_at)
+        if dt is None:
             return "churned"
-        try:
-            if hasattr(last_active_at, "timestamp"):
-                dt = datetime.fromtimestamp(last_active_at.timestamp(), tz=timezone.utc)
-            elif isinstance(last_active_at, datetime):
-                dt = last_active_at if last_active_at.tzinfo else last_active_at.replace(tzinfo=timezone.utc)
-            else:
-                return "churned"
-            days_since = (now - dt).days
-            if days_since <= 7:   return "active"
-            if days_since <= 30:  return "dormant"
-            return "churned"
-        except Exception:
-            return "churned"
+        days_since = (now - dt).days
+        if days_since <= 7:   return "active"
+        if days_since <= 30:  return "dormant"
+        return "churned"
 
     def _days_ago(ts) -> Optional[int]:
-        if ts is None:
+        dt = _to_dt(ts)
+        if dt is None:
             return None
-        try:
-            if hasattr(ts, "timestamp"):
-                dt = datetime.fromtimestamp(ts.timestamp(), tz=timezone.utc)
-            elif isinstance(ts, datetime):
-                dt = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
-            else:
-                return None
-            return max(0, (now - dt).days)
-        except Exception:
-            return None
+        return max(0, (now - dt).days)
 
     def _engagement_score(sessions: int, checkins: int, streak: int) -> float:
         """
@@ -756,8 +791,8 @@ async def team_usage(
         physical   = physical_counts.get(uid, 0)
         feats      = sorted(features_used.get(uid, set()))
         gam        = gam_map.get(uid, {})
-        streak     = int(gam.get("current_streak", 0))
-        level      = int(gam.get("level", 1))
+        streak     = _safe_int(gam.get("current_streak", 0))
+        level      = _safe_int(gam.get("level", 1))
         last_at    = udata.get("last_active_at")
         act_status = _activity_status(last_at)
 
@@ -808,7 +843,7 @@ async def team_usage(
     total_pages = max(1, (total + limit - 1) // limit)
 
     return {
-        "companyId":  company_id,
+        "companyId":  company_id_str,
         "windowDays": days,
         "employees":  result[offset: offset + limit],
         "total":      total,
@@ -840,26 +875,31 @@ async def team_usage(
 )
 async def employer_gamification(
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
-    company_id = employer.get("company_id")
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    company_id_str = employer.get("company_id")
+    if not company_id_str:
+        raise HTTPException(400, "Employer has no associated company_id.")
 
-    # ── All gamification docs for this company ────────────────────────────
-    gam_docs = []
+    import uuid as _uuid
     try:
-        gam_docs = list(
-            db.collection("user_gamification")
-            .where("company_id", "==", company_id)
-            .stream()
+        cid = _uuid.UUID(company_id_str)
+    except ValueError:
+        raise HTTPException(400, "Invalid company ID.")
+
+    # ── All gamification rows for this company ────────────────────────────
+    try:
+        gam_rows = (
+            db.query(UserGamification)
+            .filter(UserGamification.company_id == cid)
+            .all()
         )
     except Exception as e:
         raise HTTPException(500, f"user_gamification query failed: {e}")
 
-    if not gam_docs:
+    if not gam_rows:
         return {
-            "companyId": company_id,
+            "companyId": company_id_str,
             "totalPlayers": 0, "activePlayers7d": 0,
             "avgPoints": 0.0, "avgLevel": 0.0, "avgStreak": 0.0,
             "badgeDistribution": {}, "leaderboard": [],
@@ -873,46 +913,48 @@ async def employer_gamification(
     badge_dist: Dict[str, int] = {}
     leaderboard_raw = []
 
-    # Anonymous profile map
+    # Anonymous display-name lookup — uses anonymous_profiles.handle.
+    # Filter to users in this company (AnonymousProfile has no company_id col).
     anon_map: Dict[str, str] = {}
     try:
-        for doc in (
-            db.collection("anonymous_profiles")
-            .where("company_id", "==", company_id)
-            .stream()
-        ):
-            d = doc.to_dict()
-            anon_map[d.get("employee_id", "")] = d.get("display_name", "User ???")
-    except Exception:
-        pass
+        from db.models import AnonymousProfile
+        gam_user_ids = [g.user_id for g in gam_rows if g.user_id]
+        if gam_user_ids:
+            for ap in (
+                db.query(AnonymousProfile)
+                .filter(AnonymousProfile.user_id.in_(gam_user_ids))
+                .all()
+            ):
+                anon_map[ap.user_id] = ap.handle or "User ???"
+    except Exception as e:
+        print(f"[employer_gamification] anonymous_profiles error: {e}")
 
-    for doc in gam_docs:
-        d    = doc.to_dict()
-        uid  = d.get("employee_id", "")
-        pts  = _safe_int(d.get("total_points"))
-        lvl  = _safe_int(d.get("level", 1))
-        str_ = _safe_int(d.get("current_streak"))
+    for g in gam_rows:
+        uid    = g.user_id or ""
+        pts    = _safe_int(g.points)
+        lvl    = _safe_int(g.level if g.level is not None else 1)
+        streak = _safe_int(g.streak)
 
         total_pts    += pts
         total_lvl    += lvl
-        total_streak += str_
+        total_streak += streak
 
-        for badge in d.get("badges", []):
+        for badge in (g.badges or []):
             badge_dist[badge] = badge_dist.get(badge, 0) + 1
 
-        lci = d.get("last_check_in")
-        if lci and hasattr(lci, "timestamp"):
-            dt = datetime.fromtimestamp(lci.timestamp(), tz=timezone.utc)
-            if dt >= cutoff_7d:
-                active_7d += 1
+        extras = g.extras or {}
+        last_ci = extras.get("last_check_in")
+        last_dt = _to_dt(last_ci)
+        if last_dt is not None and last_dt >= cutoff_7d:
+            active_7d += 1
 
         leaderboard_raw.append({
             "rank":          0,   # filled after sort
             "displayName":   anon_map.get(uid, "User ???"),
             "level":         lvl,
             "totalPoints":   pts,
-            "currentStreak": str_,
-            "badges":        len(d.get("badges", [])),
+            "currentStreak": streak,
+            "badges":        len(g.badges or []),
         })
 
     # Sort leaderboard by points desc, assign rank
@@ -920,32 +962,36 @@ async def employer_gamification(
     for i, entry in enumerate(leaderboard_raw):
         entry["rank"] = i + 1
 
-    n = len(gam_docs)
+    n = len(gam_rows)
 
     # ── Active challenges for this company ────────────────────────────────
     active_challenges = []
     try:
-        for doc in db.collection("challenges").stream():
-            d = doc.to_dict()
-            if not d.get("is_active", False):
-                continue
-            cid = d.get("company_id")
-            if cid is not None and cid != company_id:
-                continue   # skip challenges scoped to other companies
+        from db.models import WellnessChallenge
+        ch_rows = (
+            db.query(WellnessChallenge)
+            .filter(
+                WellnessChallenge.is_active.is_(True),
+                WellnessChallenge.company_id == cid,
+            )
+            .all()
+        )
+        for ch in ch_rows:
+            data = ch.data or {}
             active_challenges.append({
-                "id":           doc.id,
-                "title":        d.get("title"),
-                "description":  d.get("description"),
-                "type":         d.get("type"),
-                "target":       d.get("target"),
-                "pointsReward": d.get("points_reward"),
-                "endsAt":       d.get("ends_at"),
+                "id":           str(ch.id),
+                "title":        ch.title,
+                "description":  ch.description,
+                "type":         data.get("type"),
+                "target":       data.get("target"),
+                "pointsReward": data.get("points_reward"),
+                "endsAt":       _ts_to_iso(ch.ends_at),
             })
     except Exception as e:
         print(f"[employer_gamification] challenges error: {e}")
 
     return {
-        "companyId":         company_id,
+        "companyId":         company_id_str,
         "totalPlayers":      n,
         "activePlayers7d":   active_7d,
         "avgPoints":         round(total_pts / n, 1),

@@ -13,7 +13,7 @@ Super Admin Router — Platform-Wide Control
   GET  /api/admin/employers                   → List all employers on the platform
   GET  /api/admin/employers/{uid}             → Get single employer profile
   PATCH /api/admin/employers/{uid}            → Update any employer profile
-  POST /api/admin/employers/{uid}/deactivate  → Disable employer + all their Firebase Auth
+  POST /api/admin/employers/{uid}/deactivate  → Disable employer
   POST /api/admin/employers/{uid}/reactivate  → Re-enable employer
   DELETE /api/admin/employers/{uid}           → Hard-delete employer + company
 
@@ -39,22 +39,23 @@ Super Admin Router — Platform-Wide Control
   POST /api/admin/users/{uid}/reset-password  → Force-set a new password for any user
 """
 
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from __future__ import annotations
 
-import httpx
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from firebase_admin import auth as fb_auth, firestore as admin_firestore
-from firebase_config import get_db, firebaseConfig
-from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 from pydantic import BaseModel, EmailStr
+from sqlalchemy.orm import Session
 
+from auth.password import hash_password, verify_password
+from db.models import Company, User
+from db.session import get_session
 from routers.auth import get_super_admin_user, RegisterRequest, RegisterResponse
 from utils.audit import log_audit
 
 router = APIRouter(prefix="/admin", tags=["Super Admin"])
-
-_Increment = admin_firestore.firestore.Increment
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -69,26 +70,28 @@ def _ts_to_iso(ts) -> Optional[str]:
     return str(ts)
 
 
-def _safe_profile(data: dict, uid: str) -> dict:
-    """Sanitise a Firestore user dict into a clean response dict."""
+def _user_to_profile(user: User) -> dict:
+    """Serialise a User ORM instance into the _safe_profile response shape."""
+    p = user.profile or {}
+    company_id_str = str(user.company_id) if user.company_id else None
     return {
-        "uid":            uid,
-        "email":          data.get("email", ""),
-        "firstName":      data.get("first_name", ""),
-        "lastName":       data.get("last_name", ""),
-        "displayName":    data.get("display_name", ""),
-        "role":           data.get("role", "unknown"),
-        "companyId":      data.get("company_id"),
-        "companyName":    data.get("company_name"),
-        "department":     data.get("department"),
-        "position":       data.get("position"),
-        "phone":          data.get("phone"),
-        "jobTitle":       data.get("job_title"),
-        "hierarchyLevel": data.get("hierarchy_level", 0),
-        "isActive":       data.get("is_active", True),
-        "createdAt":      _ts_to_iso(data.get("created_at") or data.get("registered_at")),
-        "updatedAt":      _ts_to_iso(data.get("updated_at")),
-        "createdBy":      data.get("created_by"),
+        "uid":            user.id,
+        "email":          user.email,
+        "firstName":      p.get("first_name", ""),
+        "lastName":       p.get("last_name", ""),
+        "displayName":    p.get("display_name", ""),
+        "role":           user.role,
+        "companyId":      company_id_str,
+        "companyName":    p.get("company_name"),
+        "department":     user.department,
+        "position":       p.get("position"),
+        "phone":          p.get("phone"),
+        "jobTitle":       p.get("job_title"),
+        "hierarchyLevel": p.get("hierarchy_level", 0),
+        "isActive":       user.is_active,
+        "createdAt":      _ts_to_iso(user.created_at),
+        "updatedAt":      _ts_to_iso(user.updated_at),
+        "createdBy":      p.get("created_by"),
     }
 
 
@@ -174,25 +177,23 @@ async def admin_me(admin: dict = Depends(get_super_admin_user)):
     response_model=PlatformStatsResponse,
     summary="Platform-Wide Stats",
 )
-async def platform_stats(_: dict = Depends(get_super_admin_user)):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
+async def platform_stats(
+    _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
+):
     try:
-        all_users = list(db.collection("users").stream())
+        all_users: List[User] = db.query(User).all()
     except Exception as e:
         raise HTTPException(500, f"Query failed: {e}")
 
     now = datetime.now(timezone.utc)
-    thirty_ago = now.timestamp() - (30 * 86400)
+    thirty_ago = now - timedelta(days=30)
 
     total_employers = total_employees = active = inactive = recent = 0
     roles: Dict[str, int] = {}
 
-    for doc in all_users:
-        d = doc.to_dict()
-        role = d.get("role", "unknown")
+    for user in all_users:
+        role = user.role or "unknown"
         roles[role] = roles.get(role, 0) + 1
 
         if role == "employer":
@@ -200,17 +201,21 @@ async def platform_stats(_: dict = Depends(get_super_admin_user)):
         elif role != "super_admin":
             total_employees += 1
 
-        if d.get("is_active", True):
+        if user.is_active:
             active += 1
         else:
             inactive += 1
 
-        ts = d.get("created_at") or d.get("registered_at")
-        if ts and hasattr(ts, "timestamp") and ts.timestamp() >= thirty_ago:
-            recent += 1
+        created = user.created_at
+        if created is not None:
+            # Ensure timezone-aware for comparison
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created >= thirty_ago:
+                recent += 1
 
     try:
-        total_companies = len(list(db.collection("companies").stream()))
+        total_companies = db.query(Company).count()
     except Exception:
         total_companies = total_employers  # fallback
 
@@ -242,9 +247,10 @@ async def platform_stats(_: dict = Depends(get_super_admin_user)):
 async def admin_create_employer(
     req: RegisterRequest,
     _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
-    from routers.auth import _create_employer_account
-    return await _create_employer_account(req)
+    from routers.auth import register
+    return register(req, db)
 
 
 # ─── Employers: List ─────────────────────────────────────────────────────────
@@ -260,31 +266,29 @@ async def list_employers(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     try:
-        docs = db.collection("users").where("role", "==", "employer").stream()
+        query = db.query(User).filter(User.role == "employer")
+        if not include_inactive:
+            query = query.filter(User.is_active.is_(True))
+        employers: List[User] = query.all()
     except Exception as e:
         raise HTTPException(500, f"Query failed: {e}")
 
     result = []
-    for doc in docs:
-        d = doc.to_dict()
-        if not include_inactive and not d.get("is_active", True):
-            continue
+    for user in employers:
+        profile = _user_to_profile(user)
         if search:
             term = search.lower().strip()
             searchable = " ".join([
-                f"{d.get('first_name', '')} {d.get('last_name', '')}".lower(),
-                d.get("email", "").lower(),
-                d.get("company_name", "").lower(),
+                f"{profile.get('firstName', '')} {profile.get('lastName', '')}".lower(),
+                profile.get("email", "").lower(),
+                (profile.get("companyName") or "").lower(),
             ])
             if term not in searchable:
                 continue
-        result.append(_safe_profile(d, doc.id))
+        result.append(profile)
 
     total = len(result)
     total_pages = max(1, (total + limit - 1) // limit)
@@ -304,17 +308,17 @@ async def list_employers(
 # ─── Employers: Get ───────────────────────────────────────────────────────────
 
 @router.get("/employers/{uid}", summary="Get Employer")
-async def get_employer(uid: str, _: dict = Depends(get_super_admin_user)):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-    doc = db.collection("users").document(uid).get()
-    if not doc.exists:
+async def get_employer(
+    uid: str,
+    _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
+):
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
         raise HTTPException(404, "Employer not found.")
-    d = doc.to_dict()
-    if d.get("role") != "employer":
+    if user.role != "employer":
         raise HTTPException(400, "User is not an employer.")
-    return _safe_profile(d, uid)
+    return _user_to_profile(user)
 
 
 # ─── Employers: Update ────────────────────────────────────────────────────────
@@ -327,21 +331,50 @@ async def get_employer(uid: str, _: dict = Depends(get_super_admin_user)):
 async def update_employer(
     uid: str,
     req: UpdateUserRequest,
-    admin: dict = Depends(get_super_admin_user),
+    _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
-    return await _update_user(uid, req, expected_role="employer", actor=admin)
+    return await _update_user(uid, req, expected_role="employer", db=db)
 
 
 # ─── Employers: Deactivate / Reactivate ───────────────────────────────────────
 
 @router.post("/employers/{uid}/deactivate", response_model=MutationResponse, summary="Deactivate Employer")
-async def deactivate_employer(uid: str, admin: dict = Depends(get_super_admin_user)):
-    return await _set_user_active(uid, active=False, role_check="employer", actor=admin)
+async def deactivate_employer(
+    uid: str,
+    admin: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
+):
+    result = await _set_user_active(uid, active=False, role_check="employer", db=db)
+    target = db.query(User).filter(User.id == uid).one_or_none()
+    log_audit(
+        actor_uid=admin.get("id", ""),
+        actor_role="super_admin",
+        action="employer.deactivate",
+        company_id=str(target.company_id) if target and target.company_id else "",
+        target_uid=uid,
+        target_type="employer",
+    )
+    return result
 
 
 @router.post("/employers/{uid}/reactivate", response_model=MutationResponse, summary="Reactivate Employer")
-async def reactivate_employer(uid: str, admin: dict = Depends(get_super_admin_user)):
-    return await _set_user_active(uid, active=True, role_check="employer", actor=admin)
+async def reactivate_employer(
+    uid: str,
+    admin: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
+):
+    result = await _set_user_active(uid, active=True, role_check="employer", db=db)
+    target = db.query(User).filter(User.id == uid).one_or_none()
+    log_audit(
+        actor_uid=admin.get("id", ""),
+        actor_role="super_admin",
+        action="employer.reactivate",
+        company_id=str(target.company_id) if target and target.company_id else "",
+        target_uid=uid,
+        target_type="employer",
+    )
+    return result
 
 
 # ─── Employers: Hard Delete ───────────────────────────────────────────────────
@@ -351,59 +384,42 @@ async def reactivate_employer(uid: str, admin: dict = Depends(get_super_admin_us
     response_model=MutationResponse,
     summary="Hard-Delete Employer",
     description=(
-        "⚠️ **Irreversible.** Deletes the employer's Firestore profile, company document, "
-        "and Firebase Auth account. Employees are NOT deleted — their company_id is preserved."
+        "Irreversible. Deletes the employer's user row and company row. "
+        "Employees are NOT deleted — their company_id FK is set NULL by the DB cascade."
     ),
 )
-async def delete_employer(uid: str, admin: dict = Depends(get_super_admin_user)):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
-    doc = db.collection("users").document(uid).get()
-    if not doc.exists:
+async def delete_employer(
+    uid: str,
+    admin: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
+):
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
         raise HTTPException(404, "Employer not found.")
-    d = doc.to_dict()
-    if d.get("role") != "employer":
+    if user.role != "employer":
         raise HTTPException(400, "User is not an employer.")
 
-    company_id = d.get("company_id")
-    errors: List[str] = []
+    company_id = user.company_id
 
-    # 1. Delete user document
-    try:
-        db.collection("users").document(uid).delete()
-    except Exception as e:
-        errors.append(f"user_doc: {e}")
+    # 1. Delete user row (FK ON DELETE SET NULL handles employees' company_id)
+    db.query(User).filter(User.id == uid).delete()
 
-    # 2. Delete company document
-    if company_id:
-        try:
-            db.collection("companies").document(company_id).delete()
-        except Exception as e:
-            errors.append(f"company_doc: {e}")
+    # 2. Delete company row
+    if company_id is not None:
+        db.query(Company).filter(Company.id == company_id).delete()
 
-    # 3. Delete Firebase Auth
-    try:
-        fb_auth.delete_user(uid)
-    except Exception as e:
-        errors.append(f"firebase_auth: {e}")
+    db.commit()
 
     log_audit(
         actor_uid=admin.get("id", ""),
         actor_role="super_admin",
         action="employer.delete",
-        company_id=company_id or "",
-        db=db,
+        company_id=str(company_id) if company_id is not None else "",
         target_uid=uid,
         target_type="employer",
-        metadata={"errors": errors} if errors else {},
     )
 
-    return MutationResponse(
-        success=not errors,
-        message="Employer deleted." + (f" Warnings: {errors}" if errors else ""),
-    )
+    return MutationResponse(success=True, message="Employer deleted.")
 
 
 # ─── Employees: List (cross-company) ─────────────────────────────────────────
@@ -421,40 +437,44 @@ async def list_all_employees(
     page:             int            = Query(1, ge=1),
     limit:            int            = Query(20, ge=1, le=100),
     _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     try:
+        query = db.query(User).filter(User.role.notin_(["employer", "super_admin"]))
+
         if company_id:
-            docs = db.collection("users").where("company_id", "==", company_id).stream()
-        else:
-            docs = db.collection("users").stream()
+            try:
+                cid_uuid = uuid.UUID(company_id)
+            except ValueError:
+                raise HTTPException(400, "Invalid company_id format.")
+            query = query.filter(User.company_id == cid_uuid)
+
+        if not include_inactive:
+            query = query.filter(User.is_active.is_(True))
+
+        if role_filter:
+            query = query.filter(User.role == role_filter)
+
+        users: List[User] = query.all()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, f"Query failed: {e}")
 
     result = []
-    for doc in docs:
-        d = doc.to_dict()
-        role = d.get("role", "unknown")
-        if role in ("employer", "super_admin"):
-            continue
-        if not include_inactive and not d.get("is_active", True):
-            continue
-        if role_filter and role != role_filter:
-            continue
+    for user in users:
+        profile = _user_to_profile(user)
         if search:
             term = search.lower().strip()
             searchable = " ".join([
-                f"{d.get('first_name', '')} {d.get('last_name', '')}".lower(),
-                d.get("email", "").lower(),
-                d.get("company_name", "").lower(),
-                d.get("department", "").lower(),
+                f"{profile.get('firstName', '')} {profile.get('lastName', '')}".lower(),
+                profile.get("email", "").lower(),
+                (profile.get("companyName") or "").lower(),
+                (profile.get("department") or "").lower(),
             ])
             if term not in searchable:
                 continue
-        result.append(_safe_profile(d, doc.id))
+        result.append(profile)
 
     total = len(result)
     total_pages = max(1, (total + limit - 1) // limit)
@@ -474,17 +494,17 @@ async def list_all_employees(
 # ─── Employees: Get ───────────────────────────────────────────────────────────
 
 @router.get("/employees/{uid}", summary="Get Employee (any company)")
-async def admin_get_employee(uid: str, _: dict = Depends(get_super_admin_user)):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-    doc = db.collection("users").document(uid).get()
-    if not doc.exists:
+async def admin_get_employee(
+    uid: str,
+    _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
+):
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
         raise HTTPException(404, "User not found.")
-    d = doc.to_dict()
-    if d.get("role") in ("employer", "super_admin"):
+    if user.role in ("employer", "super_admin"):
         raise HTTPException(400, "Use /employers endpoint for employer/admin profiles.")
-    return _safe_profile(d, uid)
+    return _user_to_profile(user)
 
 
 # ─── Employees: Update ────────────────────────────────────────────────────────
@@ -497,9 +517,10 @@ async def admin_get_employee(uid: str, _: dict = Depends(get_super_admin_user)):
 async def admin_update_employee(
     uid: str,
     req: UpdateUserRequest,
-    admin: dict = Depends(get_super_admin_user),
+    _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
-    return await _update_user(uid, req, expected_role=None, actor=admin)
+    return await _update_user(uid, req, expected_role=None, db=db)
 
 
 # ─── Employees: Hard Delete ───────────────────────────────────────────────────
@@ -509,81 +530,44 @@ async def admin_update_employee(
     response_model=MutationResponse,
     summary="Hard-Delete Employee",
 )
-async def admin_delete_employee(uid: str, admin: dict = Depends(get_super_admin_user)):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
-    doc = db.collection("users").document(uid).get()
-    if not doc.exists:
+async def admin_delete_employee(
+    uid: str,
+    admin: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
+):
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
         raise HTTPException(404, "User not found.")
 
-    d = doc.to_dict()
-    if d.get("role") in ("employer", "super_admin"):
+    if user.role in ("employer", "super_admin"):
         raise HTTPException(400, "Use the employer delete endpoint for employer accounts.")
 
-    errors: List[str] = []
+    company_id = user.company_id
+    target_role = user.role
 
-    # Clean up manager's direct_reports
-    manager_id = d.get("manager_id")
-    if manager_id:
-        try:
-            from google.cloud.firestore_v1 import ArrayRemove
-            db.collection("users").document(manager_id).update({
-                "direct_reports": ArrayRemove([uid]),
-                "updated_at":     SERVER_TIMESTAMP,
-            })
-        except Exception as e:
-            errors.append(f"direct_reports: {e}")
+    # Delete user row. FK ON DELETE SET NULL handles manager_id references from
+    # direct reports automatically at the DB level.
+    db.query(User).filter(User.id == uid).delete()
 
-    # Reassign this user's direct reports upward
-    for report_uid in d.get("direct_reports", []):
-        try:
-            db.collection("users").document(report_uid).update({
-                "manager_id": manager_id,
-                "updated_at": SERVER_TIMESTAMP,
-            })
-        except Exception as e:
-            errors.append(f"reassign_{report_uid}: {e}")
+    # Decrement company employee_count
+    if company_id is not None:
+        company = db.query(Company).filter(Company.id == company_id).one_or_none()
+        if company is not None and company.employee_count > 0:
+            company.employee_count -= 1
 
-    # Decrement company count
-    company_id = d.get("company_id")
-    if company_id:
-        try:
-            db.collection("companies").document(company_id).update({
-                "employee_count": _Increment(-1),
-                "updated_at":     SERVER_TIMESTAMP,
-            })
-        except Exception as e:
-            errors.append(f"count: {e}")
-
-    # Delete Firestore doc
-    try:
-        db.collection("users").document(uid).delete()
-    except Exception as e:
-        errors.append(f"firestore: {e}")
-
-    # Delete Firebase Auth
-    try:
-        fb_auth.delete_user(uid)
-    except Exception as e:
-        errors.append(f"firebase_auth: {e}")
+    db.commit()
 
     log_audit(
         actor_uid=admin.get("id", ""),
         actor_role="super_admin",
         action="user.delete",
-        company_id=d.get("company_id", ""),
-        db=db,
+        company_id=str(company_id) if company_id is not None else "",
         target_uid=uid,
         target_type="user",
-        metadata={"errors": errors} if errors else {},
+        metadata={"role": target_role},
     )
 
-    return MutationResponse(
-        success=not errors,
-        message="Employee deleted." + (f" Warnings: {errors}" if errors else ""),
-    )
+    return MutationResponse(success=True, message="Employee deleted.")
 
 
 # ─── Companies: List ─────────────────────────────────────────────────────────
@@ -594,38 +578,35 @@ async def list_all_companies(
     page:   int           = Query(1, ge=1),
     limit:  int           = Query(20, ge=1, le=100),
     _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
     try:
-        docs = list(db.collection("companies").stream())
+        all_companies: List[Company] = db.query(Company).all()
     except Exception as e:
         raise HTTPException(500, f"Query failed: {e}")
 
     companies = []
-    for doc in docs:
-        d = doc.to_dict()
+    for company in all_companies:
+        s = company.settings or {}
         if search:
             term = search.lower().strip()
             searchable = " ".join([
-                d.get("name", "").lower(),
-                d.get("industry", "").lower(),
+                company.name.lower(),
+                (s.get("industry") or "").lower(),
             ])
             if term not in searchable:
                 continue
         companies.append({
-            "id":            doc.id,
-            "name":          d.get("name"),
-            "industry":      d.get("industry"),
-            "size":          d.get("size"),
-            "ownerId":       d.get("owner_id"),
-            "employeeCount": d.get("employee_count", 0),
-            "website":       d.get("website"),
-            "description":   d.get("description"),
-            "createdAt":     _ts_to_iso(d.get("created_at")),
-            "updatedAt":     _ts_to_iso(d.get("updated_at")),
+            "id":            str(company.id),
+            "name":          company.name,
+            "industry":      s.get("industry"),
+            "size":          s.get("size"),
+            "ownerId":       company.owner_id,
+            "employeeCount": company.employee_count,
+            "website":       s.get("website"),
+            "description":   s.get("description"),
+            "createdAt":     _ts_to_iso(company.created_at),
+            "updatedAt":     _ts_to_iso(company.updated_at),
         })
 
     total = len(companies)
@@ -646,20 +627,36 @@ async def list_all_companies(
 # ─── Companies: Get ───────────────────────────────────────────────────────────
 
 @router.get("/companies/{company_id}", summary="Get Company")
-async def admin_get_company(company_id: str, _: dict = Depends(get_super_admin_user)):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-    doc = db.collection("companies").document(company_id).get()
-    if not doc.exists:
+async def admin_get_company(
+    company_id: str,
+    _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
+):
+    try:
+        cid_uuid = uuid.UUID(company_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid company_id format.")
+
+    company = db.query(Company).filter(Company.id == cid_uuid).one_or_none()
+    if company is None:
         raise HTTPException(404, "Company not found.")
-    d = doc.to_dict()
-    d["createdAt"] = _ts_to_iso(d.pop("created_at", None))
-    d["updatedAt"] = _ts_to_iso(d.pop("updated_at", None))
-    d["ownerId"] = d.pop("owner_id", None)
-    d["employeeCount"] = d.pop("employee_count", 0)
-    d["logoUrl"] = d.pop("logo_url", None)
-    return d
+
+    s = company.settings or {}
+    return {
+        "id":            str(company.id),
+        "name":          company.name,
+        "industry":      s.get("industry"),
+        "size":          s.get("size"),
+        "ownerId":       company.owner_id,
+        "employeeCount": company.employee_count,
+        "website":       s.get("website"),
+        "address":       s.get("address"),
+        "phone":         s.get("phone"),
+        "description":   s.get("description"),
+        "logoUrl":       s.get("logo_url"),
+        "createdAt":     _ts_to_iso(company.created_at),
+        "updatedAt":     _ts_to_iso(company.updated_at),
+    }
 
 
 # ─── Companies: Update ───────────────────────────────────────────────────────
@@ -672,21 +669,27 @@ async def admin_get_company(company_id: str, _: dict = Depends(get_super_admin_u
 async def admin_update_company(
     company_id: str,
     req: UpdateCompanyRequest,
-    admin: dict = Depends(get_super_admin_user),
+    _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    try:
+        cid_uuid = uuid.UUID(company_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid company_id format.")
 
-    doc = db.collection("companies").document(company_id).get()
-    if not doc.exists:
+    company = db.query(Company).filter(Company.id == cid_uuid).one_or_none()
+    if company is None:
         raise HTTPException(404, "Company not found.")
 
-    updates: Dict[str, Any] = {"updated_at": SERVER_TIMESTAMP}
     updated_fields: List[str] = []
 
-    field_map = {
-        "name":        "name",
+    # Top-level column: name
+    if req.name is not None:
+        company.name = req.name
+        updated_fields.append("name")
+
+    # settings JSONB fields
+    settings_map = {
         "industry":    "industry",
         "size":        "size",
         "website":     "website",
@@ -695,26 +698,28 @@ async def admin_update_company(
         "description": "description",
         "logoUrl":     "logo_url",
     }
-    for req_field, db_field in field_map.items():
+    new_settings = dict(company.settings or {})
+    for req_field, settings_key in settings_map.items():
         val = getattr(req, req_field, None)
         if val is not None:
-            updates[db_field] = val
+            new_settings[settings_key] = val
             updated_fields.append(req_field)
 
-    if len(updates) == 1:
+    if not updated_fields:
         raise HTTPException(400, "No fields to update.")
 
-    db.collection("companies").document(company_id).update(updates)
+    company.settings = new_settings
+    db.commit()
 
-    # Sync name change to all employees in this company
-    if "name" in updates:
+    # Sync name change to all employees' profile JSONB in this company
+    if req.name is not None:
         try:
-            emp_docs = db.collection("users").where("company_id", "==", company_id).stream()
-            for emp_doc in emp_docs:
-                db.collection("users").document(emp_doc.id).update({
-                    "company_name": updates["name"],
-                    "updated_at":   SERVER_TIMESTAMP,
-                })
+            employees = db.query(User).filter(User.company_id == cid_uuid).all()
+            for emp in employees:
+                p = dict(emp.profile or {})
+                p["company_name"] = req.name
+                emp.profile = p
+            db.commit()
         except Exception as e:
             print(f"[admin] company name sync error: {e}")
 
@@ -750,15 +755,18 @@ async def admin_update_company(
 async def admin_reset_password(
     uid: str,
     req: ResetPasswordRequest,
-    admin: dict = Depends(get_super_admin_user),
+    _: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
     if len(req.new_password) < 8:
         raise HTTPException(400, "New password must be at least 8 characters.")
 
-    try:
-        fb_auth.update_user(uid, password=req.new_password)
-    except Exception as e:
-        raise HTTPException(500, f"Password reset failed: {e}")
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
+        raise HTTPException(404, "User not found.")
+
+    user.password_hash = hash_password(req.new_password)
+    db.commit()
 
     db = get_db()
     log_audit(
@@ -787,33 +795,23 @@ async def admin_reset_password(
 async def admin_change_password(
     req: AdminChangePasswordRequest,
     admin: dict = Depends(get_super_admin_user),
+    db: Session = Depends(get_session),
 ):
     if len(req.new_password) < 8:
         raise HTTPException(400, "New password must be at least 8 characters.")
     if req.current_password == req.new_password:
         raise HTTPException(400, "New password must differ from current.")
 
-    api_key = firebaseConfig.get("apiKey")
-    if not api_key:
-        raise HTTPException(500, "Firebase API key not configured.")
+    uid = admin.get("id")
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
+        raise HTTPException(404, "User not found.")
 
-    # Re-authenticate
-    verify_url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={api_key}"
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(verify_url, json={
-            "email":             admin.get("email"),
-            "password":          req.current_password,
-            "returnSecureToken": False,
-        })
-
-    if resp.status_code != 200:
+    if user.password_hash is None or not verify_password(req.current_password, user.password_hash):
         raise HTTPException(401, "Current password is incorrect.")
 
-    uid = admin.get("id")
-    try:
-        fb_auth.update_user(uid, password=req.new_password)
-    except Exception as e:
-        raise HTTPException(500, f"Password update failed: {e}")
+    user.password_hash = hash_password(req.new_password)
+    db.commit()
 
     return MutationResponse(
         success=True,
@@ -829,77 +827,61 @@ async def _update_user(
     uid: str,
     req: UpdateUserRequest,
     expected_role: Optional[str],
-    actor: Optional[dict] = None,
+    db: Session,
 ) -> MutationResponse:
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
-    doc = db.collection("users").document(uid).get()
-    if not doc.exists:
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
         raise HTTPException(404, "User not found.")
 
-    d = doc.to_dict()
-    if expected_role and d.get("role") != expected_role:
+    if expected_role and user.role != expected_role:
         raise HTTPException(400, f"User role mismatch. Expected '{expected_role}'.")
-    if d.get("role") == "super_admin":
+    if user.role == "super_admin":
         raise HTTPException(403, "Cannot modify super admin profile via this endpoint.")
 
-    updates: Dict[str, Any] = {"updated_at": SERVER_TIMESTAMP}
     updated_fields: List[str] = []
 
-    field_map = {
+    # Top-level column: role, department, is_active
+    if req.role is not None:
+        if req.role not in VALID_ROLES:
+            raise HTTPException(400, f"Invalid role '{req.role}'.")
+        user.role = req.role
+        updated_fields.append("role")
+
+    if req.department is not None:
+        user.department = req.department
+        updated_fields.append("department")
+
+    if req.isActive is not None:
+        user.is_active = req.isActive
+        updated_fields.append("isActive")
+
+    # profile JSONB fields
+    profile_map = {
         "firstName":      "first_name",
         "lastName":       "last_name",
         "phone":          "phone",
-        "department":     "department",
         "position":       "position",
         "jobTitle":       "job_title",
         "hierarchyLevel": "hierarchy_level",
-        "isActive":       "is_active",
-        "role":           "role",
     }
-    for req_field, db_field in field_map.items():
+    new_profile = dict(user.profile or {})
+    for req_field, profile_key in profile_map.items():
         val = getattr(req, req_field, None)
         if val is not None:
-            if req_field == "role" and val not in VALID_ROLES:
-                raise HTTPException(400, f"Invalid role '{val}'.")
-            updates[db_field] = val
+            new_profile[profile_key] = val
             updated_fields.append(req_field)
 
-    if len(updates) == 1:
+    if not updated_fields:
         raise HTTPException(400, "No valid fields to update.")
 
-    # Sync name
-    if "first_name" in updates or "last_name" in updates:
-        fn = updates.get("first_name", d.get("first_name", ""))
-        ln = updates.get("last_name",  d.get("last_name",  ""))
-        updates["display_name"] = f"{fn} {ln}"
-        try:
-            fb_auth.update_user(uid, display_name=updates["display_name"])
-        except Exception as e:
-            print(f"[admin] display_name sync error: {e}")
+    # Sync display_name when name fields change
+    if req.firstName is not None or req.lastName is not None:
+        fn = new_profile.get("first_name", "")
+        ln = new_profile.get("last_name", "")
+        new_profile["display_name"] = f"{fn} {ln}".strip()
 
-    # Sync is_active → Firebase Auth disabled flag
-    if "is_active" in updates:
-        try:
-            fb_auth.update_user(uid, disabled=not updates["is_active"])
-        except Exception as e:
-            print(f"[admin] is_active sync error: {e}")
-
-    db.collection("users").document(uid).update(updates)
-
-    if actor:
-        log_audit(
-            actor_uid=actor.get("id", ""),
-            actor_role="super_admin",
-            action="user.update",
-            company_id=d.get("company_id", ""),
-            db=db,
-            target_uid=uid,
-            target_type="employer" if d.get("role") == "employer" else "user",
-            metadata={"updated_fields": updated_fields},
-        )
+    user.profile = new_profile
+    db.commit()
 
     return MutationResponse(
         success=True,
@@ -908,31 +890,16 @@ async def _update_user(
     )
 
 
-async def _set_user_active(uid: str, active: bool, role_check: str, actor: Optional[dict] = None) -> MutationResponse:
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
-
-    doc = db.collection("users").document(uid).get()
-    if not doc.exists:
+async def _set_user_active(uid: str, active: bool, role_check: str, db: Session) -> MutationResponse:
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
         raise HTTPException(404, "User not found.")
 
-    d = doc.to_dict()
-    if d.get("role") != role_check:
+    if user.role != role_check:
         raise HTTPException(400, f"User is not a {role_check}.")
 
-    try:
-        fb_auth.update_user(uid, disabled=not active)
-        # Revoke all existing tokens when deactivating so active sessions end immediately
-        if not active:
-            fb_auth.revoke_refresh_tokens(uid)
-    except Exception as e:
-        print(f"[admin] Firebase Auth toggle error: {e}")
-
-    db.collection("users").document(uid).update({
-        "is_active":  active,
-        "updated_at": SERVER_TIMESTAMP,
-    })
+    user.is_active = active
+    db.commit()
 
     if actor:
         audit_action = f"employer.{'reactivate' if active else 'deactivate'}"

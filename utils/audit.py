@@ -1,75 +1,68 @@
+"""Audit logger (Postgres).
+
+Writes one row to ``audit_logs`` per admin/employer mutation. Fire-and-forget —
+spawns a daemon thread so the request path is never blocked.
+
+Action constants used by callers (kept stable for analytics queries):
+
+    user.create / user.update / user.deactivate / user.reactivate
+    user.delete / user.password_reset
+    company.update
+    employer.deactivate / employer.reactivate / employer.delete
 """
-Audit Logger
-=============
-Fire-and-forget audit trail for admin and employer actions.
 
-Writes one record to Firestore `audit_logs` per mutation.
-All writes happen in a daemon thread — never blocks the request path.
-
-Firestore schema — audit_logs/{auto_id}:
-{
-    actor_uid:    str,          # uid of the user who performed the action
-    actor_role:   str,          # "employer" | "hr" | "super_admin"
-    action:       str,          # see ACTION CONSTANTS below
-    target_uid:   str | null,   # uid of the affected user (null for company actions)
-    target_type:  str,          # "user" | "company" | "employer"
-    company_id:   str,          # scoping — company that owns the target
-    metadata:     dict,         # extra context (changed_fields, plan_tier, etc.)
-    timestamp:    Timestamp,
-    success:      bool,
-}
-
-ACTION CONSTANTS
-----------------
-  user.create           employee or employer created
-  user.update           profile fields changed
-  user.deactivate       account soft-disabled
-  user.reactivate       account re-enabled
-  user.delete           hard-delete
-  user.password_reset   forced password change
-  company.update        company document patched
-  employer.deactivate   employer account disabled
-  employer.reactivate   employer account re-enabled
-  employer.delete       employer hard-deleted
-"""
+from __future__ import annotations
 
 import threading
+import uuid
 from typing import Any, Dict, Optional
 
-from google.cloud.firestore_v1 import SERVER_TIMESTAMP
+from db.models import AuditLog
+from db.session import get_session_factory
+
+
+def _to_uuid(value) -> Optional[uuid.UUID]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, uuid.UUID):
+        return value
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, TypeError):
+        return None
 
 
 def log_audit(
-    actor_uid:   str,
-    actor_role:  str,
-    action:      str,
-    company_id:  str,
-    db,
-    target_uid:  Optional[str]        = None,
-    target_type: str                  = "user",
-    metadata:    Optional[Dict[str, Any]] = None,
-    success:     bool                 = True,
+    actor_uid: str,
+    actor_role: str,
+    action: str,
+    company_id: str,
+    db=None,  # accepted for backward-compat with the Firestore-era signature
+    target_uid: Optional[str] = None,
+    target_type: str = "user",
+    metadata: Optional[Dict[str, Any]] = None,
+    success: bool = True,
 ) -> None:
-    """
-    Fire-and-forget: write one audit_log record to Firestore.
-    Spawns a daemon thread — returns immediately, never raises.
-    """
-    if not db:
-        return
+    """Fire-and-forget: write one audit_log row. Spawns a daemon thread."""
+    company_uuid = _to_uuid(company_id)
 
     def _write():
         try:
-            db.collection("audit_logs").add({
-                "actor_uid":   actor_uid  or "unknown",
-                "actor_role":  actor_role or "unknown",
-                "action":      action,
-                "target_uid":  target_uid,
-                "target_type": target_type,
-                "company_id":  company_id or "",
-                "metadata":    metadata or {},
-                "timestamp":   SERVER_TIMESTAMP,
-                "success":     success,
-            })
+            SessionLocal = get_session_factory()
+            with SessionLocal() as session:
+                session.add(
+                    AuditLog(
+                        actor_uid=actor_uid or "unknown",
+                        actor_role=actor_role or "unknown",
+                        action=action,
+                        target_uid=target_uid,
+                        target_type=target_type,
+                        company_id=company_uuid,
+                        audit_metadata=metadata or {},
+                        success=success,
+                    )
+                )
+                session.commit()
         except Exception as e:
             print(f"[audit] write error ({action}): {e}")
 

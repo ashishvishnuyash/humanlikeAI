@@ -23,9 +23,11 @@ load_dotenv()
 from typing import Annotated, List, TypedDict, Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends
+import asyncio
+
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
@@ -59,10 +61,11 @@ from routers.employee_import import router as employee_import_router
 from routers.physical_health import router as physical_health_router
 from routers.admin_metrics import router as admin_metrics_router
 from middleware.activity_tracker import persist_chat_session
-from firebase_config import get_db
-from firebase_admin import auth as _fb_auth
+from auth.jwt_utils import InvalidTokenError, decode_access_token
+from db.models import User
+from db.session import get_session_factory
 
-# Optional bearer for /chat — does not reject unauthenticated requests
+# Optional bearer for /chat — does not reject unauthenticated requests.
 _optional_bearer = HTTPBearer(auto_error=False)
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -457,20 +460,27 @@ async def chat(
     if not os.environ.get("OPENAI_API_KEY"):
         raise HTTPException(500, "OPENAI_API_KEY not configured.")
 
-    # ── Resolve caller identity (optional auth) ──────────────────────────────
-    uid        = "anonymous"
+    # Resolve caller identity (optional auth — anonymous /chat is still allowed).
+    uid = "anonymous"
     company_id = ""
     if credentials:
         try:
-            decoded = _fb_auth.verify_id_token(credentials.credentials, check_revoked=True)
-            uid = decoded.get("uid", "anonymous")
-            db  = get_db()
-            if db and uid != "anonymous":
-                user_doc = db.collection("users").document(uid).get()
-                if user_doc.exists:
-                    company_id = user_doc.to_dict().get("company_id", "") or ""
+            claims = decode_access_token(credentials.credentials)
+            uid = claims.get("sub") or "anonymous"
+            cid = claims.get("company_id")
+            if cid:
+                company_id = str(cid)
+            elif uid != "anonymous":
+                # Fallback: look up the company on the user row.
+                SessionLocal = get_session_factory()
+                with SessionLocal() as s:
+                    user = s.query(User).filter(User.id == uid).one_or_none()
+                    if user is not None and user.company_id is not None:
+                        company_id = str(user.company_id)
+        except InvalidTokenError:
+            pass  # Non-fatal — fall through as anonymous.
         except Exception:
-            pass  # Non-fatal — fall through as anonymous
+            pass
 
     sid, session = _get_or_create_session(req.session_id)
     session["messages"].append(HumanMessage(content=req.message))
@@ -503,15 +513,15 @@ async def chat(
     prev_mem_count = len(session.get("memories", [])) - len(result.get("new_memories", []))
     fresh = result.get("new_memories", [])[prev_mem_count:] if prev_mem_count >= 0 else []
 
-    # ── Persist session to Firestore (non-blocking) ──────────────────────────
-    db = get_db()
-    if db:
+    # Fire-and-forget chat-session persistence (skipped for anonymous callers
+    # since chat_sessions.user_id is NOT NULL and we don't write a real user
+    # row for them).
+    if uid and uid != "anonymous":
         asyncio.create_task(persist_chat_session(
-            session_id    = sid,
-            user_id       = uid,
-            company_id    = company_id,
-            message_count = len(session["messages"]),
-            db            = db,
+            session_id=sid,
+            user_id=uid,
+            company_id=company_id,
+            message_count=len(session["messages"]),
         ))
 
     return ChatResponse(

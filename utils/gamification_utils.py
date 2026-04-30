@@ -1,62 +1,75 @@
-"""
-Gamification Utilities
-=======================
-Shared helpers for awarding points and writing gamification_events.
+"""Shared helpers for awarding points and writing gamification_events (Postgres).
 
 Called from feature endpoints after qualifying user actions:
-  - Daily check-in     → award_points(event_type="daily_checkin",     points=10)
-  - Conversation done  → award_points(event_type="conversation",       points=15)
-  - Physical check-in  → award_points(event_type="physical_checkin",  points=10)
-  - Challenge complete → award_points(event_type="challenge_complete", points=50)
-  - Badge unlocked     → award_points(event_type="badge_unlock",       points=0)
+    Daily check-in       award_points(event_type="daily_checkin",     points=10)
+    Conversation done    award_points(event_type="conversation",       points=15)
+    Physical check-in    award_points(event_type="physical_checkin",  points=10)
+    Challenge complete   award_points(event_type="challenge_complete", points=50)
+    Badge unlocked       award_points(event_type="badge_unlock",       points=0)
 
-Fire-and-forget: all writes happen in a daemon thread — never blocks the request path.
+Fire-and-forget — runs in a daemon thread so the request path is never blocked.
 
-Firestore collections touched:
-  user_gamification/{doc_id}   — per-user stats (keyed by employee_id + company_id)
-  gamification_events/{auto}   — immutable event log (for audit + leaderboard history)
+Tables touched:
+    user_gamification    per-user stats (one row per user_id; extras JSONB
+                         holds longest_streak, last_check_in, weekly_goal,
+                         monthly_goal, challenges_completed)
+    gamification_events  immutable point-award log
 """
 
+from __future__ import annotations
+
 import threading
+import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from google.cloud.firestore_v1 import SERVER_TIMESTAMP
-from google.cloud.firestore_v1.transforms import Increment
+from db.models import GamificationEvent, UserGamification
+from db.session import get_session_factory
 
 
-# ─── Level thresholds (mirrors community_gamification.py) ────────────────────
+# ─── Level thresholds (mirrors community_gamification.py) ─────────────────────
+
 
 def calculate_level(pts: int) -> int:
-    if pts < 100:   return 1
-    if pts < 300:   return 2
-    if pts < 600:   return 3
-    if pts < 1000:  return 4
-    if pts < 1500:  return 5
-    if pts < 2100:  return 6
-    if pts < 2800:  return 7
-    if pts < 3600:  return 8
-    if pts < 4500:  return 9
-    if pts < 5500:  return 10
+    if pts < 100:
+        return 1
+    if pts < 300:
+        return 2
+    if pts < 600:
+        return 3
+    if pts < 1000:
+        return 4
+    if pts < 1500:
+        return 5
+    if pts < 2100:
+        return 6
+    if pts < 2800:
+        return 7
+    if pts < 3600:
+        return 8
+    if pts < 4500:
+        return 9
+    if pts < 5500:
+        return 10
     return 10 + int((pts - 5500) / 1500)
 
 
-def _check_new_badges(stats: dict) -> List[str]:
-    existing = set(stats.get("badges", []))
+def _check_new_badges(stats: UserGamification) -> List[str]:
+    existing = set(stats.badges or [])
     new_badges: List[str] = []
-    pts    = stats.get("total_points", 0)
-    streak = stats.get("current_streak", 0)
-    lvl    = stats.get("level", 1)
+    pts = stats.points or 0
+    streak = stats.streak or 0
+    lvl = stats.level or 1
 
     candidates = [
-        ("first_check_in",  pts > 0),
-        ("week_warrior",    streak >= 7),
-        ("month_master",    streak >= 30),
-        ("century_streak",  streak >= 100),
+        ("first_check_in", pts > 0),
+        ("week_warrior", streak >= 7),
+        ("month_master", streak >= 30),
+        ("century_streak", streak >= 100),
         ("point_collector", pts >= 1000),
-        ("point_master",    pts >= 5000),
-        ("level_five",      lvl >= 5),
-        ("level_ten",       lvl >= 10),
+        ("point_master", pts >= 5000),
+        ("level_five", lvl >= 5),
+        ("level_ten", lvl >= 10),
     ]
     for badge, earned in candidates:
         if earned and badge not in existing:
@@ -64,89 +77,83 @@ def _check_new_badges(stats: dict) -> List[str]:
     return new_badges
 
 
+def _to_uuid(value) -> Optional[uuid.UUID]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, uuid.UUID):
+        return value
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, TypeError):
+        return None
+
+
 # ─── Main helper ──────────────────────────────────────────────────────────────
+
 
 def award_points(
     employee_id: str,
-    company_id:  str,
-    event_type:  str,
-    points:      int,
-    db,
-    metadata:    Optional[dict] = None,
+    company_id: str,
+    event_type: str,
+    points: int,
+    db=None,  # accepted for backward-compat with the Firestore-era signature
+    metadata: Optional[dict] = None,
 ) -> None:
-    """
-    Fire-and-forget: award `points` to a user, update their level, check badges,
-    and write one gamification_events record.
+    """Fire-and-forget: award points, update level/badges, write event log row."""
+    if not employee_id or not company_id:
+        return
 
-    employee_id — the Firebase UID of the user (called employee_id in user_gamification)
-    event_type  — "daily_checkin" | "conversation" | "physical_checkin"
-                  | "challenge_complete" | "badge_unlock"
-    """
-    if not db or not employee_id or not company_id:
+    company_uuid = _to_uuid(company_id)
+    if company_uuid is None:
         return
 
     def _write():
         try:
-            # ── Find or create user_gamification doc ──────────────────────
-            ref_col = db.collection("user_gamification")
-            docs    = list(
-                ref_col
-                .where("employee_id", "==", employee_id)
-                .where("company_id",  "==", company_id)
-                .limit(1)
-                .stream()
-            )
+            SessionLocal = get_session_factory()
+            with SessionLocal() as session:
+                stats = (
+                    session.query(UserGamification)
+                    .filter(UserGamification.user_id == employee_id)
+                    .one_or_none()
+                )
+                if stats is None:
+                    stats = UserGamification(
+                        id=uuid.uuid4(),
+                        user_id=employee_id,
+                        company_id=company_uuid,
+                        points=0,
+                        level=1,
+                        streak=0,
+                        badges=[],
+                        extras={
+                            "longest_streak": 0,
+                            "challenges_completed": 0,
+                            "last_check_in": None,
+                            "weekly_goal": 5,
+                            "monthly_goal": 20,
+                        },
+                    )
+                    session.add(stats)
+                    session.flush()
 
-            if docs:
-                doc_ref = ref_col.document(docs[0].id)
-                stats   = docs[0].to_dict()
-            else:
-                # Lazy creation
-                new_stats = {
-                    "employee_id":           employee_id,
-                    "company_id":            company_id,
-                    "current_streak":        0,
-                    "longest_streak":        0,
-                    "total_points":          0,
-                    "level":                 1,
-                    "badges":                [],
-                    "challenges_completed":  0,
-                    "last_check_in":         None,
-                    "weekly_goal":           5,
-                    "monthly_goal":          20,
-                    "created_at":            SERVER_TIMESTAMP,
-                    "updated_at":            SERVER_TIMESTAMP,
-                }
-                _, doc_ref = ref_col.add(new_stats)
-                stats = new_stats
+                if points > 0:
+                    stats.points = (stats.points or 0) + points
+                    stats.level = calculate_level(stats.points)
+                    new_badges = _check_new_badges(stats)
+                    if new_badges:
+                        stats.badges = [*stats.badges, *new_badges]
 
-            if points > 0:
-                new_total = int(stats.get("total_points", 0)) + points
-                new_level = calculate_level(new_total)
-
-                doc_ref.update({
-                    "total_points": Increment(points),
-                    "level":        new_level,
-                    "updated_at":   SERVER_TIMESTAMP,
-                })
-
-                # Re-read for badge check
-                fresh = doc_ref.get().to_dict() or {}
-                new_badges = _check_new_badges(fresh)
-                if new_badges:
-                    current_badges = fresh.get("badges", [])
-                    doc_ref.update({"badges": current_badges + new_badges})
-
-            # ── Write gamification_events record ──────────────────────────
-            db.collection("gamification_events").add({
-                "employee_id": employee_id,
-                "company_id":  company_id,
-                "event_type":  event_type,
-                "points":      points,
-                "metadata":    metadata or {},
-                "created_at":  SERVER_TIMESTAMP,
-            })
-
+                session.add(
+                    GamificationEvent(
+                        id=uuid.uuid4(),
+                        user_id=employee_id,
+                        company_id=company_uuid,
+                        event_type=event_type,
+                        points=points,
+                        event_metadata=metadata or {},
+                    )
+                )
+                session.commit()
         except Exception as e:
             print(f"[gamification_utils] award_points error ({event_type}): {e}")
 

@@ -1,13 +1,18 @@
 import json
 import os
 import time
+import uuid
 import httpx
 from datetime import datetime
 from typing import List, Optional, Literal, Union, Dict, Any, Annotated
-from fastapi import APIRouter, Request, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, Depends, Request, HTTPException
 from pydantic import BaseModel, Field
 from openai import OpenAI
-from firebase_config import get_db
+from sqlalchemy.orm import Session
+
+from db.session import get_session
+from db.models.mental_health import MentalHealthReport
+from middleware.usage_tracker import track_usage, tokens_from_openai_completion
 from report_schemas import ReportRequest, ReportResponse
 from report_agent import run_report
 from middleware.usage_tracker import track_usage, tokens_from_openai_completion
@@ -93,7 +98,7 @@ def get_assessment_questions(test_name: str) -> str:
     norm = test_name.lower().replace(" ", "_")
     if norm not in ASSESSMENT_DATA:
         return f"Assessment '{test_name}' not found."
-    
+
     test = ASSESSMENT_DATA[norm]
     out = f"Great! Here are the questions for {test_name}.\n\n{test.get('scoring_instructions', '')}\n\n"
     if norm == 'personality_profiler':
@@ -110,16 +115,16 @@ async def generate_chat_response(messages: List[dict], files_text: str, uma_sess
         if m.get('sender') == 'user':
             last_user_msg = m.get('content', '')
             break
-            
+
     message_for_uma = last_user_msg
     if files_text:
         message_for_uma += f"\n\n{files_text}"
-        
+
     try:
         from main import chat as uma_chat_endpoint, ChatRequest
         req = ChatRequest(message=message_for_uma, session_id=uma_session_id)
         uma_resp_obj = await uma_chat_endpoint(req)
-        
+
         emotion = uma_resp_obj.peek.emotion
 
         emotion_to_avatar = {
@@ -146,63 +151,80 @@ async def generate_chat_response(messages: List[dict], files_text: str, uma_sess
         print(f"Error calling native Uma: {e}")
         raise HTTPException(status_code=500, detail="Failed to reach Uma AI agent.")
 
-async def generate_wellness_report(messages: List[dict], session_type: str, session_duration: int, user_id: str, company_id: str):
+async def generate_wellness_report(
+    messages: List[dict],
+    session_type: str,
+    session_duration: int,
+    user_id: str,
+    company_id_str: str,
+    db: Session,
+):
     try:
-        from report_agent import run_report
-        from google.cloud.firestore_v1 import SERVER_TIMESTAMP
-        db = get_db()
-        
         lines = []
         for m in messages:
             role = "User" if m.get('sender') == 'user' else "Assistant"
             lines.append(f"{role}: {m.get('content', '')}")
         conversation_text = "\n".join(lines)
-        
+
         report_res = run_report(user_id=user_id, conversation_text=conversation_text)
-        
+
         raw_report = report_res.model_dump(mode="json")
-        
-        report_data = {**raw_report}
-        report_data.update({
-            'employee_id': user_id,
-            'company_id': company_id,
-            'session_type': session_type,
-            'session_duration_minutes': session_duration,
-            'created_at': SERVER_TIMESTAMP
-        })
-        
-        if db and user_id and company_id:
-            try:
-                db.collection('mental_health_reports').add(report_data)
-            except Exception as e:
-                print(f"Firestore save error: {e}")
-                
+
         client_data = {
             **raw_report,
             'employee_id': user_id,
-            'company_id': company_id,
+            'company_id': company_id_str,
             'session_type': session_type,
             'session_duration_minutes': session_duration
         }
+
+        if user_id:
+            try:
+                company_uuid: Optional[uuid.UUID] = None
+                if company_id_str:
+                    try:
+                        company_uuid = uuid.UUID(company_id_str)
+                    except ValueError:
+                        company_uuid = None
+
+                risk_level = raw_report.get('risk_level') or raw_report.get('riskLevel')
+
+                r = MentalHealthReport(
+                    id=uuid.uuid4(),
+                    user_id=user_id,
+                    company_id=company_uuid,
+                    report={
+                        **raw_report,
+                        'session_type': session_type,
+                        'session_duration_minutes': session_duration,
+                    },
+                    risk_level=risk_level,
+                )
+                db.add(r)
+                db.commit()
+            except Exception as e:
+                print(f"DB save error: {e}")
+                db.rollback()
+
         return {"type": "report", "data": client_data}
-        
+
     except Exception as e:
         print(f"Error generating wellness report natively: {e}")
         return {"type": "report", "data": {"error": str(e)}}
 
 @router.post("", response_model=ChatHandlerResponse)
-async def chat_handler(request: Request):
+async def chat_handler(request: Request, db: Session = Depends(get_session)):
     content_type = request.headers.get("content-type", "")
-    
+
     req_data = {}
     files_text = ""
-    
+
     if "multipart/form-data" in content_type:
         form = await request.form()
         data_str = form.get("data")
         if data_str:
             req_data = json.loads(data_str)
-            
+
         uploaded_files = form.getlist("files")
         file_parts = []
         for f in uploaded_files:
@@ -215,11 +237,11 @@ async def chat_handler(request: Request):
             req_data = await request.json()
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid or missing JSON body")
-        
+
     messages = req_data.get("messages", [])
     if not messages:
         raise HTTPException(status_code=400, detail="Messages array is required")
-        
+
     assessment_type = req_data.get("assessmentType")
     if assessment_type == "get_questions":
         last_msg = messages[-1].get("content", "")
@@ -233,19 +255,20 @@ async def chat_handler(request: Request):
                     "testName": test_name
                 }
             }
-            
+
     if req_data.get("endSession"):
         return await generate_wellness_report(
             messages,
             req_data.get("sessionType", "text"),
             req_data.get("sessionDuration", 0),
             req_data.get("userId", ""),
-            req_data.get("companyId", "")
+            req_data.get("companyId", ""),
+            db,
         )
-        
+
     return await generate_chat_response(
-        messages, 
-        files_text, 
+        messages,
+        files_text,
         req_data.get("umaSessionId")
     )
 
@@ -260,13 +283,13 @@ class AiChatReq(BaseModel):
 async def handle_ai_chat(req: AiChatReq):
     if not req.message:
         raise HTTPException(400, "Message is required")
-        
+
     openai = get_openai_client()
     system_prompt = "You are a real person having a caring conversation. Be supportive, empathetic, and genuinely interested in their wellbeing. Keep responses warm, natural, and conversational.\n\nCRITICAL: You are NOT an AI or assistant. You're a real person. NEVER mention being an AI or that you're evaluating their health. Just be a caring friend who's listening."
-    
+
     if req.context == "personal_wellness":
         system_prompt = "You are a real person having a caring conversation with someone in a leadership position. You genuinely want to understand what they're going through and offer support.\n\nCRITICAL: You are NOT an AI, assistant, or technology. You're a real person. NEVER mention being an AI or evaluating their health."
-        
+
     try:
         _t0 = time.time()
         completion = openai.chat.completions.create(
@@ -278,19 +301,18 @@ async def handle_ai_chat(req: AiChatReq):
             max_tokens=300,
             temperature=0.7
         )
-        _latency = int((time.time() - _t0) * 1000)
+        _latency_ms = int((time.time() - _t0) * 1000)
         resp_text = completion.choices[0].message.content or "I apologize, but I was unable to generate a response."
 
         _tin, _tout = tokens_from_openai_completion(completion)
         track_usage(
-            user_id    = req.user_id or "anonymous",
-            company_id = "",
-            feature    = "chat",
-            model      = "gpt-4",
-            tokens_in  = _tin,
-            tokens_out = _tout,
-            db         = get_db(),
-            latency_ms = _latency,
+            user_id=req.user_id or "anonymous",
+            company_id="",
+            feature="chat",
+            model="gpt-4",
+            tokens_in=_tin,
+            tokens_out=_tout,
+            latency_ms=_latency_ms,
         )
 
         return {
@@ -318,5 +340,5 @@ async def analyze_chat_wrapper_standalone(req: ReportRequest):
         role = "User" if m.role.lower() == "user" else "Assistant"
         lines.append(f"{role}: {m.content}")
     conversation_text = "\n".join(lines)
-    
+
     return run_report(user_id=req.user_id, conversation_text=conversation_text)

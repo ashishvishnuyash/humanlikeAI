@@ -14,21 +14,22 @@ Employee Management — Employer-Only APIs
 All write operations require the caller to be role: employer or hr AND share the same company_id.
 """
 
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from firebase_admin import auth as fb_auth, firestore as admin_firestore
-from firebase_config import get_db
-from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 from pydantic import BaseModel, EmailStr
+from sqlalchemy.orm import Session
 
+from auth.password import hash_password
+from db.models.company import Company
+from db.models.mental_health import CheckIn
+from db.models.mental_health import Session as MHSession
+from db.models.user import User
+from db.session import get_session
 from routers.auth import get_current_user, get_employer_user
 from utils.audit import log_audit
-
-# Firestore atomic increment helper
-_firestore_increment = admin_firestore.firestore.Increment
-
 
 router = APIRouter(tags=["Employees"])
 
@@ -125,8 +126,9 @@ def _ts_to_iso(ts) -> Optional[str]:
     return str(ts)
 
 
-def _build_profile(uid: str, data: dict) -> EmployeeProfile:
-    perms = {k: data.get(k, False) for k in (
+def _build_profile_from_user(user: User) -> EmployeeProfile:
+    profile = user.profile or {}
+    perms = {k: profile.get(k, False) for k in (
         "can_view_team_reports",
         "can_manage_employees",
         "can_approve_leaves",
@@ -135,21 +137,21 @@ def _build_profile(uid: str, data: dict) -> EmployeeProfile:
         "skip_level_access",
     )}
     return EmployeeProfile(
-        uid=uid,
-        email=data.get("email", ""),
-        firstName=data.get("first_name", ""),
-        lastName=data.get("last_name", ""),
-        role=data.get("role", "employee"),
-        department=data.get("department"),
-        position=data.get("position"),
-        phone=data.get("phone"),
-        companyId=data.get("company_id", ""),
-        managerId=data.get("manager_id"),
-        hierarchyLevel=data.get("hierarchy_level", 1),
-        isActive=data.get("is_active", True),
+        uid=user.id,
+        email=user.email,
+        firstName=profile.get("first_name", ""),
+        lastName=profile.get("last_name", ""),
+        role=user.role,
+        department=user.department,
+        position=profile.get("position"),
+        phone=profile.get("phone"),
+        companyId=str(user.company_id) if user.company_id else "",
+        managerId=user.manager_id,
+        hierarchyLevel=profile.get("hierarchy_level", 1),
+        isActive=user.is_active,
         permissions=perms,
-        createdAt=_ts_to_iso(data.get("created_at")),
-        createdBy=data.get("created_by"),
+        createdAt=_ts_to_iso(user.created_at),
+        createdBy=profile.get("created_by"),
     )
 
 
@@ -176,6 +178,14 @@ def _default_permissions(role: str) -> Dict[str, bool]:
     return base
 
 
+def _parse_company_uuid(cid_str: str) -> uuid.UUID:
+    """Convert a company_id string to UUID, raising HTTP 400 on invalid input."""
+    try:
+        return uuid.UUID(cid_str)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail=f"Invalid company_id: {cid_str!r}")
+
+
 # ─── Create Employee (Employer-Only) ─────────────────────────────────────────
 
 @router.post(
@@ -192,6 +202,7 @@ def _default_permissions(role: str) -> Dict[str, bool]:
 async def create_employee(
     req: CreateEmployeeRequest,
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
     # ── Validation ────────────────────────────────────────────────────────
     if len(req.password) < 6:
@@ -203,84 +214,84 @@ async def create_employee(
             f"Invalid role '{req.role}'. Allowed: {sorted(VALID_EMPLOYEE_ROLES)}.",
         )
 
-    employer_company_id = employer.get("company_id")
-    if not employer_company_id:
+    employer_company_id_str = employer.get("company_id")
+    if not employer_company_id_str:
         raise HTTPException(400, "Employer profile is missing a company_id.")
 
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    employer_company_uuid = _parse_company_uuid(str(employer_company_id_str))
+
+    # ── Check for duplicate email ──────────────────────────────────────────
+    existing = db.query(User).filter(User.email == req.email).one_or_none()
+    if existing:
+        raise HTTPException(409, "An account with this email already exists.")
 
     # ── Validate managerId belongs to same company ─────────────────────────
     manager_id = req.managerId if req.managerId and req.managerId != "none" else None
     if manager_id:
-        mgr_doc = db.collection("users").document(manager_id).get()
-        if not mgr_doc.exists or mgr_doc.to_dict().get("company_id") != employer_company_id:
+        mgr = db.query(User).filter(User.id == manager_id).one_or_none()
+        if mgr is None or str(mgr.company_id) != str(employer_company_uuid):
             raise HTTPException(
                 400,
                 "Specified managerId does not belong to your company.",
             )
 
-    # ── Create Firebase Auth account ───────────────────────────────────────
-    try:
-        fb_user = fb_auth.create_user(
-            email=req.email,
-            password=req.password,
-            display_name=f"{req.firstName} {req.lastName}",
-        )
-    except Exception as e:
-        err = str(e)
-        if "EMAIL_EXISTS" in err or "email-already-exists" in err:
-            raise HTTPException(409, "An account with this email already exists.")
-        raise HTTPException(500, f"Firebase Auth error: {err}")
-
-    uid = fb_user.uid
-
-    # ── Build Firestore document ───────────────────────────────────────────
+    # ── Build permissions ──────────────────────────────────────────────────
     default_perms = _default_permissions(req.role)
-    # Employer can override specific permissions
     if req.permissions:
         default_perms.update(req.permissions)
 
-    doc_data: Dict[str, Any] = {
-        "id": uid,
-        "email": req.email,
-        "first_name": req.firstName,
-        "last_name": req.lastName,
-        "display_name": f"{req.firstName} {req.lastName}",
-        "role": req.role,
-        "department": req.department,
-        "position": req.position,
-        "phone": req.phone,
-        "company_id": employer_company_id,
-        "company_name": employer.get("company_name", ""),
-        "manager_id": manager_id,
+    uid = str(uuid.uuid4())
+
+    profile_data: Dict[str, Any] = {
+        "first_name":      req.firstName,
+        "last_name":       req.lastName,
+        "display_name":    f"{req.firstName} {req.lastName}",
+        "position":        req.position,
+        "phone":           req.phone,
+        "company_name":    employer.get("company_name", ""),
         "hierarchy_level": req.hierarchyLevel,
-        "direct_reports": [],
-        "reporting_chain": [],
-        "is_active": True,
-        "created_by": employer.get("id"),          # audit trail — employer uid
-        "created_at": SERVER_TIMESTAMP,
-        "updated_at": SERVER_TIMESTAMP,
+        "created_by":      employer.get("id"),
         **default_perms,
     }
 
-    try:
-        db.collection("users").document(uid).set(doc_data)
+    new_user = User(
+        id=uid,
+        email=req.email,
+        password_hash=hash_password(req.password),
+        role=req.role,
+        company_id=employer_company_uuid,
+        manager_id=manager_id,
+        department=req.department or None,
+        is_active=True,
+        profile=profile_data,
+    )
 
-        # Update company employee_count atomically
-        db.collection("companies").document(employer_company_id).update({
-            "employee_count": _firestore_increment(1),
-            "updated_at": SERVER_TIMESTAMP,
-        })
+    try:
+        db.add(new_user)
+        db.flush()  # get PK into session before updating company
+
+        # Update company employee_count
+        company = db.query(Company).filter(Company.id == employer_company_uuid).one_or_none()
+        if company is not None:
+            db.query(Company).filter(Company.id == employer_company_uuid).update(
+                {"employee_count": Company.employee_count + 1}
+            )
+
+        db.commit()
     except Exception as e:
-        # Rollback Firebase Auth user if Firestore write fails
-        try:
-            fb_auth.delete_user(uid)
-        except Exception:
-            pass
-        print(f"[users] create_employee Firestore error: {e}")
-        raise HTTPException(500, "Failed to save employee profile. Account creation rolled back.")
+        db.rollback()
+        print(f"[users] create_employee DB error: {e}")
+        raise HTTPException(500, "Failed to save employee profile.")
+
+    log_audit(
+        actor_uid=employer.get("id", ""),
+        actor_role=employer.get("role", "employer"),
+        action="user.create",
+        company_id=str(employer_company_uuid) if employer_company_uuid else "",
+        target_uid=uid,
+        target_type="user",
+        metadata={"role": req.role, "email": req.email, "department": req.department},
+    )
 
     log_audit(
         actor_uid=employer.get("id", ""),
@@ -316,49 +327,45 @@ async def list_employees(
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     limit: int = Query(20, ge=1, le=100, description="Records per page"),
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
-    company_id = employer.get("company_id")
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    company_id_str = employer.get("company_id")
+    company_uuid = _parse_company_uuid(str(company_id_str))
 
     try:
-        # Push is_active filter to Firestore so we don't fetch unnecessary docs
-        query = db.collection("users").where("company_id", "==", company_id)
+        query = db.query(User).filter(User.company_id == company_uuid)
         if not include_inactive:
-            query = query.where("is_active", "==", True)
-        docs = query.stream()
+            query = query.filter(User.is_active == True)  # noqa: E712
+        all_users = query.all()
     except Exception as e:
         raise HTTPException(500, f"Database query failed: {e}")
 
     employees: List[EmployeeProfile] = []
-    for doc in docs:
-        data = doc.to_dict()
-        uid  = doc.id
-
+    for user in all_users:
         # Skip the employer themselves
-        if data.get("role") == "employer":
+        if user.role == "employer":
             continue
         # Filter by department (exact match)
-        if department and data.get("department", "").lower() != department.lower():
+        if department and (user.department or "").lower() != department.lower():
             continue
         # Filter by role
-        if role_filter and data.get("role") != role_filter:
+        if role_filter and user.role != role_filter:
             continue
         # Search across name, email, department, job title
         if search:
+            profile = user.profile or {}
             term = search.lower().strip()
-            full_name = f"{data.get('first_name', '')} {data.get('last_name', '')}".lower()
+            full_name = f"{profile.get('first_name', '')} {profile.get('last_name', '')}".lower()
             searchable = " ".join([
                 full_name,
-                data.get("email", "").lower(),
-                data.get("department", "").lower(),
-                data.get("position", "").lower(),
+                user.email.lower(),
+                (user.department or "").lower(),
+                (profile.get("position", "") or "").lower(),
             ])
             if term not in searchable:
                 continue
 
-        employees.append(_build_profile(uid, data))
+        employees.append(_build_profile_from_user(user))
 
     total = len(employees)
     total_pages = max(1, (total + limit - 1) // limit)
@@ -369,7 +376,7 @@ async def list_employees(
         success=True,
         employees=page_employees,
         total=total,
-        companyId=company_id,
+        companyId=str(company_uuid),
         page=page,
         limit=limit,
         totalPages=total_pages,
@@ -389,24 +396,22 @@ async def list_employees(
 async def get_employee(
     uid: str,
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
-    company_id = employer.get("company_id")
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    company_id_str = employer.get("company_id")
+    company_uuid = _parse_company_uuid(str(company_id_str))
 
-    doc = db.collection("users").document(uid).get()
-    if not doc.exists:
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
         raise HTTPException(404, "Employee not found.")
 
-    data = doc.to_dict()
-    if data.get("company_id") != company_id:
+    if user.company_id != company_uuid:
         raise HTTPException(403, "Employee does not belong to your company.")
 
-    if data.get("role") == "employer":
+    if user.role == "employer":
         raise HTTPException(403, "Cannot view employer profiles via this endpoint.")
 
-    return _build_profile(uid, data)
+    return _build_profile_from_user(user)
 
 
 # ─── Update Employee ──────────────────────────────────────────────────────────
@@ -421,74 +426,87 @@ async def update_employee(
     uid: str,
     req: UpdateEmployeeRequest,
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
-    company_id = employer.get("company_id")
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    company_id_str = employer.get("company_id")
+    company_uuid = _parse_company_uuid(str(company_id_str))
 
-    doc = db.collection("users").document(uid).get()
-    if not doc.exists:
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
         raise HTTPException(404, "Employee not found.")
 
-    data = doc.to_dict()
-    if data.get("company_id") != company_id:
+    if user.company_id != company_uuid:
         raise HTTPException(403, "Employee does not belong to your company.")
 
-    if data.get("role") == "employer":
+    if user.role == "employer":
         raise HTTPException(403, "Cannot modify employer accounts via this endpoint.")
 
-    # Build update payload — only set fields that were explicitly provided
-    updates: Dict[str, Any] = {"updated_at": SERVER_TIMESTAMP}
     updated_fields: List[str] = []
+    profile = dict(user.profile or {})
 
-    field_map = {
-        "firstName":     "first_name",
-        "lastName":      "last_name",
-        "department":    "department",
-        "position":      "position",
-        "phone":         "phone",
-        "hierarchyLevel":"hierarchy_level",
-        "role":          "role",
+    # Profile JSONB fields
+    profile_field_map = {
+        "firstName":      "first_name",
+        "lastName":       "last_name",
+        "position":       "position",
+        "phone":          "phone",
+        "hierarchyLevel": "hierarchy_level",
     }
-    for req_field, db_field in field_map.items():
+    for req_field, profile_key in profile_field_map.items():
         val = getattr(req, req_field, None)
         if val is not None:
-            if req_field == "role" and val not in VALID_EMPLOYEE_ROLES:
-                raise HTTPException(400, f"Invalid role '{val}'.")
-            updates[db_field] = val
-            updated_fields.append(db_field)
+            profile[profile_key] = val
+            updated_fields.append(profile_key)
+
+    # Top-level column fields
+    if req.department is not None:
+        user.department = req.department
+        updated_fields.append("department")
+
+    if req.role is not None:
+        if req.role not in VALID_EMPLOYEE_ROLES:
+            raise HTTPException(400, f"Invalid role '{req.role}'.")
+        user.role = req.role
+        updated_fields.append("role")
 
     # managerId special handling
     if req.managerId is not None:
         manager_id = req.managerId if req.managerId != "none" else None
         if manager_id:
-            mgr_doc = db.collection("users").document(manager_id).get()
-            if not mgr_doc.exists or mgr_doc.to_dict().get("company_id") != company_id:
+            mgr = db.query(User).filter(User.id == manager_id).one_or_none()
+            if mgr is None or str(mgr.company_id) != str(company_uuid):
                 raise HTTPException(400, "Specified managerId does not belong to your company.")
-        updates["manager_id"] = manager_id
+        user.manager_id = manager_id
         updated_fields.append("manager_id")
 
-    # Permissions override
+    # Permissions stored in profile JSONB
     if req.permissions:
-        updates.update(req.permissions)
+        profile.update(req.permissions)
         updated_fields.extend(list(req.permissions.keys()))
 
     # Rebuild display_name if name changed
-    if "first_name" in updates or "last_name" in updates:
-        fn = updates.get("first_name", data.get("first_name", ""))
-        ln = updates.get("last_name",  data.get("last_name",  ""))
-        updates["display_name"] = f"{fn} {ln}"
-        # Sync to Firebase Auth
-        try:
-            fb_auth.update_user(uid, display_name=updates["display_name"])
-        except Exception as e:
-            print(f"[users] Firebase display_name sync failed: {e}")
+    if "first_name" in updated_fields or "last_name" in updated_fields:
+        fn = profile.get("first_name", "")
+        ln = profile.get("last_name", "")
+        profile["display_name"] = f"{fn} {ln}"
 
-    if len(updates) == 1:  # only updated_at
+    if not updated_fields:
         raise HTTPException(400, "No valid fields to update.")
 
-    db.collection("users").document(uid).update(updates)
+    # Write back merged profile (replace dict to trigger SQLAlchemy change detection)
+    user.profile = profile
+
+    db.commit()
+
+    log_audit(
+        actor_uid=employer.get("id", ""),
+        actor_role=employer.get("role", "employer"),
+        action="user.update",
+        company_id=str(user.company_id) if user.company_id else "",
+        target_uid=uid,
+        target_type="user",
+        metadata={"updated_fields": updated_fields},
+    )
 
     log_audit(
         actor_uid=employer.get("id", ""),
@@ -520,8 +538,9 @@ async def update_employee(
 async def deactivate_employee(
     uid: str,
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
-    return await _set_employee_active(uid, active=False, employer=employer)
+    return await _set_employee_active(uid, active=False, employer=employer, db=db)
 
 
 @router.post(
@@ -533,39 +552,35 @@ async def deactivate_employee(
 async def reactivate_employee(
     uid: str,
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
-    return await _set_employee_active(uid, active=True, employer=employer)
+    return await _set_employee_active(uid, active=True, employer=employer, db=db)
 
 
-async def _set_employee_active(uid: str, active: bool, employer: dict) -> DeactivateResponse:
-    company_id = employer.get("company_id")
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+async def _set_employee_active(uid: str, active: bool, employer: dict, db: Session) -> DeactivateResponse:
+    company_id_str = employer.get("company_id")
+    company_uuid = _parse_company_uuid(str(company_id_str))
 
-    doc = db.collection("users").document(uid).get()
-    if not doc.exists:
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
         raise HTTPException(404, "Employee not found.")
 
-    data = doc.to_dict()
-    if data.get("company_id") != company_id:
+    if user.company_id != company_uuid:
         raise HTTPException(403, "Employee does not belong to your company.")
-    if data.get("role") == "employer":
+    if user.role == "employer":
         raise HTTPException(403, "Cannot modify employer accounts.")
 
-    # Sync disabled status to Firebase Auth
-    try:
-        fb_auth.update_user(uid, disabled=not active)
-        # Revoke all existing tokens when deactivating so active sessions end immediately
-        if not active:
-            fb_auth.revoke_refresh_tokens(uid)
-    except Exception as e:
-        print(f"[users] Firebase Auth update_user error: {e}")
+    user.is_active = active
+    db.commit()
 
-    db.collection("users").document(uid).update({
-        "is_active":  active,
-        "updated_at": SERVER_TIMESTAMP,
-    })
+    log_audit(
+        actor_uid=employer.get("id", ""),
+        actor_role=employer.get("role", "employer"),
+        action="user.reactivate" if active else "user.deactivate",
+        company_id=str(company_uuid),
+        target_uid=uid,
+        target_type="user",
+    )
 
     audit_action = "user.reactivate" if active else "user.deactivate"
     log_audit(
@@ -599,81 +614,66 @@ class DeleteEmployeeResponse(BaseModel):
     response_model=DeleteEmployeeResponse,
     summary="Permanently Delete Employee",
     description=(
-        "**Employer only (not HR).** Permanently deletes a Firebase Auth account and "
-        "Firestore profile. This action is irreversible. "
+        "**Employer only (not HR).** Permanently deletes an employee account and "
+        "profile. This action is irreversible. "
         "Use `POST /employees/{uid}/deactivate` for a reversible soft-delete."
     ),
 )
 async def delete_employee(
     uid: str,
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
     if employer.get("role") != "employer":
         raise HTTPException(403, "Only the company owner can permanently delete employee accounts.")
 
-    company_id = employer.get("company_id")
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    company_id_str = employer.get("company_id")
+    company_uuid = _parse_company_uuid(str(company_id_str))
 
-    doc = db.collection("users").document(uid).get()
-    if not doc.exists:
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
         raise HTTPException(404, "Employee not found.")
 
-    data = doc.to_dict()
-    if data.get("company_id") != company_id:
+    if user.company_id != company_uuid:
         raise HTTPException(403, "Employee does not belong to your company.")
-    if data.get("role") == "employer":
+    if user.role == "employer":
         raise HTTPException(403, "Cannot delete the employer owner account via this endpoint.")
 
-    errors: List[str] = []
+    manager_id = user.manager_id
 
-    # 1. Remove from manager's direct_reports list
-    manager_id = data.get("manager_id")
-    if manager_id:
-        try:
-            from google.cloud.firestore_v1 import ArrayRemove
-            db.collection("users").document(manager_id).update({
-                "direct_reports": ArrayRemove([uid]),
-                "updated_at":     SERVER_TIMESTAMP,
-            })
-        except Exception as e:
-            errors.append(f"direct_reports_cleanup: {e}")
+    # Reassign this employee's direct reports to their manager
+    # (direct_reports array is gone; query by manager_id instead)
+    direct_report_users = (
+        db.query(User)
+        .filter(User.manager_id == uid)  # noqa: E712
+        .all()
+    )
+    for report_user in direct_report_users:
+        report_user.manager_id = manager_id  # could be None (becomes top-level)
 
-    # 2. Reassign this employee's direct reports to their manager
-    direct_reports: List[str] = data.get("direct_reports", [])
-    for report_uid in direct_reports:
-        try:
-            db.collection("users").document(report_uid).update({
-                "manager_id": manager_id,   # could be None (becomes top-level)
-                "updated_at": SERVER_TIMESTAMP,
-            })
-        except Exception as e:
-            errors.append(f"reassign_{report_uid}: {e}")
+    # Explicit cross-collection cleanup (FK CASCADE also handles these,
+    # but kept for clarity / belt-and-suspenders)
+    db.query(CheckIn).filter(CheckIn.user_id == uid).delete()
+    db.query(MHSession).filter(MHSession.user_id == uid).delete()
 
-    # 3. Delete Firestore document
-    try:
-        db.collection("users").document(uid).delete()
-    except Exception as e:
-        errors.append(f"firestore_delete: {e}")
+    # Delete the user row
+    db.query(User).filter(User.id == uid).delete()
 
-    # 4. Decrement company employee_count
-    try:
-        db.collection("companies").document(company_id).update({
-            "employee_count": _firestore_increment(-1),
-            "updated_at":     SERVER_TIMESTAMP,
-        })
-    except Exception as e:
-        errors.append(f"count_decrement: {e}")
+    # Decrement company employee_count
+    db.query(Company).filter(Company.id == company_uuid).update(
+        {"employee_count": Company.employee_count - 1}
+    )
 
-    # 5. Delete Firebase Auth account
-    try:
-        fb_auth.delete_user(uid)
-    except Exception as e:
-        errors.append(f"firebase_auth: {e}")
+    db.commit()
 
-    if errors:
-        print(f"[users] delete_employee partial errors for {uid}: {errors}")
+    log_audit(
+        actor_uid=employer.get("id", ""),
+        actor_role=employer.get("role", "employer"),
+        action="user.delete",
+        company_id=str(company_uuid),
+        target_uid=uid,
+        target_type="user",
+    )
 
     log_audit(
         actor_uid=employer.get("id", ""),
@@ -689,10 +689,7 @@ async def delete_employee(
     return DeleteEmployeeResponse(
         success=True,
         uid=uid,
-        message=(
-            f"Employee deleted permanently."
-            + (f" Warnings: {errors}" if errors else "")
-        ),
+        message="Employee deleted permanently.",
     )
 
 
@@ -740,18 +737,17 @@ class BulkCreateResponse(BaseModel):
 async def bulk_create_employees(
     employees: List[BulkCreateItem],
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
     if not employees:
         raise HTTPException(400, "Employee list cannot be empty.")
     if len(employees) > 50:
         raise HTTPException(400, "Cannot create more than 50 employees per request.")
 
-    company_id   = employer.get("company_id")
+    company_id_str = employer.get("company_id")
+    company_uuid = _parse_company_uuid(str(company_id_str))
     company_name = employer.get("company_name", "")
     creator_uid  = employer.get("id")
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
 
     results: List[BulkCreateResult] = []
     created = 0
@@ -771,29 +767,22 @@ async def bulk_create_employees(
             failed += 1
             continue
 
-        try:
-            fb_user = fb_auth.create_user(
-                email=item.email,
-                password=item.password,
-                display_name=f"{item.firstName} {item.lastName}",
-            )
-            uid = fb_user.uid
-        except Exception as e:
-            err = str(e)
-            if "EMAIL_EXISTS" in err or "email-already-exists" in err:
-                err = "Email already exists."
-            results.append(BulkCreateResult(email=item.email, success=False, error=err))
+        # Check for duplicate email
+        existing = db.query(User).filter(User.email == item.email).one_or_none()
+        if existing:
+            results.append(BulkCreateResult(
+                email=item.email, success=False, error="Email already exists."))
             failed += 1
             continue
 
         manager_id = item.managerId if item.managerId and item.managerId != "none" else None
         item_warnings: List[str] = []
 
-        # Validate manager belongs to same company (mirrors single-create validation)
+        # Validate manager belongs to same company
         if manager_id:
             try:
-                mgr_doc = db.collection("users").document(manager_id).get()
-                if not mgr_doc.exists or mgr_doc.to_dict().get("company_id") != company_id:
+                mgr = db.query(User).filter(User.id == manager_id).one_or_none()
+                if mgr is None or str(mgr.company_id) != str(company_uuid):
                     item_warnings.append(
                         f"Manager '{manager_id}' not found in your company — manager link skipped."
                     )
@@ -803,55 +792,42 @@ async def bulk_create_employees(
                 manager_id = None
 
         perms = _default_permissions(item.role)
-        doc_data: Dict[str, Any] = {
-            "id":             uid,
-            "email":          item.email,
-            "first_name":     item.firstName,
-            "last_name":      item.lastName,
-            "display_name":   f"{item.firstName} {item.lastName}",
-            "role":           item.role,
-            "department":     item.department,
-            "position":       item.position,
-            "phone":          item.phone,
-            "company_id":     company_id,
-            "company_name":   company_name,
-            "manager_id":     manager_id,
-            "hierarchy_level":item.hierarchyLevel,
-            "direct_reports": [],
-            "reporting_chain":[],
-            "is_active":      True,
-            "created_by":     creator_uid,
-            "created_at":     SERVER_TIMESTAMP,
-            "updated_at":     SERVER_TIMESTAMP,
+        uid = str(uuid.uuid4())
+
+        profile_data: Dict[str, Any] = {
+            "first_name":      item.firstName,
+            "last_name":       item.lastName,
+            "display_name":    f"{item.firstName} {item.lastName}",
+            "position":        item.position,
+            "phone":           item.phone,
+            "company_name":    company_name,
+            "hierarchy_level": item.hierarchyLevel,
+            "created_by":      creator_uid,
             **perms,
         }
 
+        new_user = User(
+            id=uid,
+            email=item.email,
+            password_hash=hash_password(item.password),
+            role=item.role,
+            company_id=company_uuid,
+            manager_id=manager_id,
+            department=item.department or None,
+            is_active=True,
+            profile=profile_data,
+        )
+
         try:
-            db.collection("users").document(uid).set(doc_data)
+            db.add(new_user)
+            db.flush()
         except Exception as e:
-            # Firestore write failed — rollback Firebase Auth to avoid orphaned account
-            try:
-                fb_auth.delete_user(uid)
-            except Exception:
-                pass
+            db.rollback()
             results.append(BulkCreateResult(
                 email=item.email, success=False,
-                error=f"Profile save failed: {e}. Auth account cleaned up."))
+                error=f"Profile save failed: {e}."))
             failed += 1
             continue
-
-        # Update manager's direct_reports list now that employee doc exists
-        if manager_id:
-            try:
-                from google.cloud.firestore_v1 import ArrayUnion
-                db.collection("users").document(manager_id).update({
-                    "direct_reports": ArrayUnion([uid]),
-                    "updated_at":     SERVER_TIMESTAMP,
-                })
-            except Exception as e:
-                item_warnings.append(
-                    f"Employee created but manager's direct_reports could not be updated: {e}"
-                )
 
         created += 1
         results.append(BulkCreateResult(
@@ -864,19 +840,22 @@ async def bulk_create_employees(
     # Update company employee_count once at end
     if created > 0:
         try:
-            db.collection("companies").document(company_id).update({
-                "employee_count": _firestore_increment(created),
-                "updated_at":     SERVER_TIMESTAMP,
-            })
+            db.query(Company).filter(Company.id == company_uuid).update(
+                {"employee_count": Company.employee_count + created}
+            )
+            db.commit()
         except Exception as e:
+            db.rollback()
             print(f"[users] bulk_create count update error: {e}")
+    else:
+        db.rollback()
 
     return BulkCreateResponse(
         success=failed == 0,
         created=created,
         failed=failed,
         results=results,
-        companyId=company_id,
+        companyId=str(company_uuid),
     )
 
 
@@ -902,83 +881,62 @@ class TransferEmployeeResponse(BaseModel):
     summary="Transfer / Reassign Employee",
     description=(
         "**Employer / HR only.** Move an employee to a different manager, department, or position. "
-        "Automatically updates the old manager's `direct_reports` list and adds to new manager's list."
+        "Automatically updates manager links without denormalized direct_reports arrays."
     ),
 )
 async def transfer_employee(
     uid: str,
     req: TransferEmployeeRequest,
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
-    company_id = employer.get("company_id")
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    company_id_str = employer.get("company_id")
+    company_uuid = _parse_company_uuid(str(company_id_str))
 
-    doc = db.collection("users").document(uid).get()
-    if not doc.exists:
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
         raise HTTPException(404, "Employee not found.")
 
-    data = doc.to_dict()
-    if data.get("company_id") != company_id:
+    if user.company_id != company_uuid:
         raise HTTPException(403, "Employee does not belong to your company.")
-    if data.get("role") == "employer":
+    if user.role == "employer":
         raise HTTPException(403, "Cannot transfer employer accounts.")
 
-    old_manager_id = data.get("manager_id")
+    old_manager_id = user.manager_id
     new_manager_id = req.newManagerId if req.newManagerId and req.newManagerId != "none" else None
 
     # Validate new manager belongs to same company
     if new_manager_id:
-        mgr_doc = db.collection("users").document(new_manager_id).get()
-        if not mgr_doc.exists or mgr_doc.to_dict().get("company_id") != company_id:
+        mgr = db.query(User).filter(User.id == new_manager_id).one_or_none()
+        if mgr is None or str(mgr.company_id) != str(company_uuid):
             raise HTTPException(400, "New managerId does not belong to your company.")
 
     changes: Dict[str, Any] = {}
-    updates: Dict[str, Any] = {"updated_at": SERVER_TIMESTAMP}
+    profile = dict(user.profile or {})
 
     if req.newManagerId is not None:      # explicit field provided (even if None)
-        updates["manager_id"] = new_manager_id
+        user.manager_id = new_manager_id
         changes["manager_id"] = {"from": old_manager_id, "to": new_manager_id}
 
     if req.newDepartment is not None:
-        updates["department"] = req.newDepartment
-        changes["department"] = {"from": data.get("department"), "to": req.newDepartment}
+        changes["department"] = {"from": user.department, "to": req.newDepartment}
+        user.department = req.newDepartment
 
     if req.newPosition is not None:
-        updates["position"] = req.newPosition
-        changes["position"] = {"from": data.get("position"), "to": req.newPosition}
+        changes["position"] = {"from": profile.get("position"), "to": req.newPosition}
+        profile["position"] = req.newPosition
 
     if req.newHierarchyLevel is not None:
-        updates["hierarchy_level"] = req.newHierarchyLevel
-        changes["hierarchy_level"] = {"from": data.get("hierarchy_level"), "to": req.newHierarchyLevel}
+        changes["hierarchy_level"] = {"from": profile.get("hierarchy_level"), "to": req.newHierarchyLevel}
+        profile["hierarchy_level"] = req.newHierarchyLevel
 
     if not changes:
         raise HTTPException(400, "No transfer fields provided.")
 
-    # Apply main update
-    db.collection("users").document(uid).update(updates)
+    # Write back merged profile
+    user.profile = profile
 
-    # ── Update direct_reports lists ───────────────────────────────────────
-    if "manager_id" in changes:
-        try:
-            from google.cloud.firestore_v1 import ArrayRemove, ArrayUnion
-
-            # Remove from old manager
-            if old_manager_id:
-                db.collection("users").document(old_manager_id).update({
-                    "direct_reports": ArrayRemove([uid]),
-                    "updated_at":     SERVER_TIMESTAMP,
-                })
-
-            # Add to new manager
-            if new_manager_id:
-                db.collection("users").document(new_manager_id).update({
-                    "direct_reports": ArrayUnion([uid]),
-                    "updated_at":     SERVER_TIMESTAMP,
-                })
-        except Exception as e:
-            print(f"[users] transfer direct_reports update error: {e}")
+    db.commit()
 
     return TransferEmployeeResponse(
         success=True,
@@ -1016,20 +974,18 @@ class ActivitySummaryResponse(BaseModel):
 async def get_employee_activity(
     uid: str,
     employer: dict = Depends(get_employer_user),
+    db: Session = Depends(get_session),
 ):
-    company_id = employer.get("company_id")
-    db = get_db()
-    if not db:
-        raise HTTPException(503, "Database unavailable")
+    company_id_str = employer.get("company_id")
+    company_uuid = _parse_company_uuid(str(company_id_str))
 
-    doc = db.collection("users").document(uid).get()
-    if not doc.exists:
+    user = db.query(User).filter(User.id == uid).one_or_none()
+    if user is None:
         raise HTTPException(404, "Employee not found.")
 
-    data = doc.to_dict()
-    if data.get("company_id") != company_id:
+    if user.company_id != company_uuid:
         raise HTTPException(403, "Employee does not belong to your company.")
-    if data.get("role") == "employer":
+    if user.role == "employer":
         raise HTTPException(403, "Cannot view employer activity via this endpoint.")
 
     now = datetime.now(timezone.utc)
@@ -1038,20 +994,22 @@ async def get_employee_activity(
     total_checkins = 0
     mood_sum = 0.0
     stress_sum = 0.0
-    last_active_ts = None
+    last_active_ts: Optional[float] = None
     risk_counts: Dict[str, int] = {"low": 0, "medium": 0, "high": 0}
 
     try:
-        ci_docs = db.collection("check_ins").where("user_id", "==", uid).stream()
-        for ci in ci_docs:
-            d = ci.to_dict()
+        ci_rows = db.query(CheckIn).filter(CheckIn.user_id == uid).all()
+        for ci in ci_rows:
+            d = ci.data or {}
             total_checkins += 1
             mood_sum   += float(d.get("mood_score", 0) or 0)
             stress_sum += float(d.get("stress_level", 0) or 0)
-            ts = d.get("created_at")
-            if ts and hasattr(ts, "timestamp"):
-                if last_active_ts is None or ts.timestamp() > last_active_ts:
-                    last_active_ts = ts.timestamp()
+            ts = ci.created_at
+            if ts is not None:
+                ts_val = ts.timestamp() if hasattr(ts, "timestamp") else None
+                if ts_val is not None:
+                    if last_active_ts is None or ts_val > last_active_ts:
+                        last_active_ts = ts_val
             risk = d.get("risk_level", "low")
             if risk in risk_counts:
                 risk_counts[risk] += 1
@@ -1063,16 +1021,19 @@ async def get_employee_activity(
     modalities: Dict[str, int] = {}
 
     try:
-        sess_docs = db.collection("sessions").where("user_id", "==", uid).stream()
-        for s in sess_docs:
-            d = s.to_dict()
+        sess_rows = db.query(MHSession).filter(MHSession.user_id == uid).all()
+        for s in sess_rows:
+            d = s.messages or {}
             total_sessions += 1
-            mod = d.get("modality", "unknown")
+            # modality stored in messages dict or session data
+            mod = d.get("modality", "unknown") if isinstance(d, dict) else "unknown"
             modalities[mod] = modalities.get(mod, 0) + 1
-            ts = d.get("created_at")
-            if ts and hasattr(ts, "timestamp"):
-                if last_active_ts is None or ts.timestamp() > last_active_ts:
-                    last_active_ts = ts.timestamp()
+            ts = s.created_at
+            if ts is not None:
+                ts_val = ts.timestamp() if hasattr(ts, "timestamp") else None
+                if ts_val is not None:
+                    if last_active_ts is None or ts_val > last_active_ts:
+                        last_active_ts = ts_val
     except Exception as e:
         print(f"[users] sessions query error: {e}")
 
@@ -1090,7 +1051,7 @@ async def get_employee_activity(
 
     return ActivitySummaryResponse(
         uid=uid,
-        companyId=company_id,
+        companyId=str(company_uuid),
         totalCheckIns=total_checkins,
         totalSessions=total_sessions,
         lastActiveAt=last_active_iso,
@@ -1102,7 +1063,7 @@ async def get_employee_activity(
     )
 
 
-
+# ─── Hierarchy Test Stubs ─────────────────────────────────────────────────────
 
 class HierarchyTestPost(BaseModel):
     userId: str
