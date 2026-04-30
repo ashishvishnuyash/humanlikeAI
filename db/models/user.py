@@ -40,6 +40,7 @@ class User(Base):
     profile: Mapped[dict] = mapped_column(
         JSONB, nullable=False, server_default="{}"
     )
+    last_active_at: Mapped[datetime | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         nullable=False, server_default=func.now()
     )

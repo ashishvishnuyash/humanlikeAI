@@ -50,6 +50,12 @@ from db.models.community import (  # noqa: E402
 )
 from db.models.calls import Call, CallSession  # noqa: E402
 from db.models.imports import ImportJob  # noqa: E402
+from db.models.audit_usage import (  # noqa: E402
+    AuditLog,
+    CompanyCredit,
+    GamificationEvent,
+    UsageLog,
+)
 
 
 # Post-declare companies.owner_id -> users.id to avoid circular imports.
@@ -91,4 +97,8 @@ __all__ = [
     "Call",
     "CallSession",
     "ImportJob",
+    "UsageLog",
+    "AuditLog",
+    "CompanyCredit",
+    "GamificationEvent",
 ]

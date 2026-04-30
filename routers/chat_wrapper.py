@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import uuid
 import httpx
 from datetime import datetime
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from db.session import get_session
 from db.models.mental_health import MentalHealthReport
+from middleware.usage_tracker import track_usage, tokens_from_openai_completion
 from report_schemas import ReportRequest, ReportResponse
 from report_agent import run_report
 
@@ -288,6 +290,7 @@ async def handle_ai_chat(req: AiChatReq):
         system_prompt = "You are a real person having a caring conversation with someone in a leadership position. You genuinely want to understand what they're going through and offer support.\n\nCRITICAL: You are NOT an AI, assistant, or technology. You're a real person. NEVER mention being an AI or evaluating their health."
 
     try:
+        _t0 = time.time()
         completion = openai.chat.completions.create(
             model="gpt-4",
             messages=[
@@ -297,7 +300,20 @@ async def handle_ai_chat(req: AiChatReq):
             max_tokens=300,
             temperature=0.7
         )
+        _latency_ms = int((time.time() - _t0) * 1000)
         resp_text = completion.choices[0].message.content or "I apologize, but I was unable to generate a response."
+
+        _tin, _tout = tokens_from_openai_completion(completion)
+        track_usage(
+            user_id=req.user_id or "anonymous",
+            company_id="",
+            feature="chat",
+            model="gpt-4",
+            tokens_in=_tin,
+            tokens_out=_tout,
+            latency_ms=_latency_ms,
+        )
+
         return {
             "response": resp_text,
             "session_id": req.session_id,

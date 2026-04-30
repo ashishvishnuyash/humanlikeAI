@@ -45,8 +45,14 @@ def get_current_user(
             detail=f"Invalid or expired authentication token: {exc}",
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
+    uid = claims.get("sub")
+    if uid:
+        # Fire-and-forget last-active stamp so analytics dashboards stay fresh.
+        # Imported lazily to avoid a circular import at module load time.
+        from middleware.activity_tracker import update_last_active
+        update_last_active(uid)
     return {
-        "uid": claims.get("sub"),
+        "uid": uid,
         "email": claims.get("email"),
         "role": claims.get("role"),
         "company_id": claims.get("company_id"),

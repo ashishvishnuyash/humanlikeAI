@@ -8,6 +8,7 @@ LLM pipeline functions for:
 Called by routers/physical_health.py — never called directly by main.py.
 """
 
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
@@ -15,6 +16,7 @@ from typing import List, Optional
 from langchain_openai import ChatOpenAI
 
 from db.session import get_session_factory
+from middleware.usage_tracker import track_usage, tokens_from_langchain_raw
 from db.models.physical_health import (
     MedicalDocument,
     PhysicalHealthCheckin,
@@ -62,20 +64,37 @@ class _PeriodicReportLLMOutput(BaseModel):
 
 # ─── Medical document analysis ───────────────────────────────────────────────
 
-def analyze_medical_document(raw_text: str) -> MedicalReportAnalysis:
+def analyze_medical_document(
+    raw_text: str,
+    user_id: str = "",
+    company_id: str = "",
+) -> MedicalReportAnalysis:
     """
     Node 1: LLM reads raw medical report text and returns structured findings.
     Uses structured output — returns MedicalReportAnalysis directly.
     """
     llm = _get_llm(temperature=0.1)
-    structured = llm.with_structured_output(MedicalReportAnalysis)
-    result = (ANALYZE_MEDICAL_REPORT | structured).invoke({"report_text": raw_text})
-    return result
+    structured = llm.with_structured_output(MedicalReportAnalysis, include_raw=True)
+    t0 = time.time()
+    raw = (ANALYZE_MEDICAL_REPORT | structured).invoke({"report_text": raw_text})
+    _tin, _tout = tokens_from_langchain_raw(raw["raw"])
+    track_usage(
+        user_id=user_id,
+        company_id=company_id,
+        feature="physical_health",
+        model="gpt-4o-mini",
+        tokens_in=_tin,
+        tokens_out=_tout,
+        latency_ms=int((time.time() - t0) * 1000),
+    )
+    return raw["parsed"]
 
 
 def generate_health_suggestions(
     analysis: MedicalReportAnalysis,
     checkin_context: str,
+    user_id: str = "",
+    company_id: str = "",
 ) -> List[str]:
     """
     Node 2: LLM generates personalised lifestyle suggestions combining
@@ -96,11 +115,22 @@ def generate_health_suggestions(
 
     findings_summary = f"{analysis.summary}\n\n{flagged_summary}"
 
+    t0 = time.time()
     response = llm.invoke(
         GENERATE_HEALTH_SUGGESTIONS.format_messages(
             findings_summary=findings_summary,
             checkin_context=checkin_context or "No recent check-in data available.",
         )
+    )
+    _meta = getattr(response, "usage_metadata", None) or {}
+    track_usage(
+        user_id=user_id,
+        company_id=company_id,
+        feature="physical_health",
+        model="gpt-4o-mini",
+        tokens_in=int(_meta.get("input_tokens", 0)),
+        tokens_out=int(_meta.get("output_tokens", 0)),
+        latency_ms=int((time.time() - t0) * 1000),
     )
     raw = response.content.strip()
 
@@ -147,7 +177,9 @@ async def process_medical_document(
     """
     try:
         # Step 1 — LLM analysis
-        analysis = analyze_medical_document(raw_text)
+        analysis = analyze_medical_document(
+            raw_text, user_id=user_id, company_id=company_id
+        )
 
         # Step 2 — RAG ingestion (filtered by user_id so Q&A stays private)
         # chunk_ids will be persisted in Phase 5 (rag_chunk_ids column on MedicalDocument)
@@ -174,7 +206,9 @@ async def process_medical_document(
 
         # Step 4 — personalised suggestions
         # suggestions will be persisted in Phase 5 (metadata JSONB column on MedicalDocument)
-        suggestions = generate_health_suggestions(analysis, checkin_context)  # noqa: F841
+        suggestions = generate_health_suggestions(  # noqa: F841
+            analysis, checkin_context, user_id=user_id, company_id=company_id
+        )
 
         # Step 5 — update extracted_text if it was empty at upload time
         # (Phase 5 will persist full analysis metadata via a JSONB column)

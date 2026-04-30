@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import uuid
 from datetime import datetime
 from typing import List
@@ -10,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from db.session import get_session
 from db.models.mental_health import AIRecommendation as AIRecommendationModel, ChatSession
+from middleware.usage_tracker import track_usage, tokens_from_openai_completion
 from routers.auth import get_current_user
 
 router = APIRouter(prefix="/recommendations", tags=["Recommendations"], dependencies=[Depends(get_current_user)])
@@ -286,6 +288,7 @@ Guidelines:
 - Ensure duration matches their available time
 - Include variety in recommendation types"""
 
+        _t0 = time.time()
         completion = openai_client.chat.completions.create(
             model="gpt-4",
             messages=[
@@ -294,6 +297,17 @@ Guidelines:
             ],
             temperature=0.7,
             max_tokens=2000,
+        )
+        _latency_ms = int((time.time() - _t0) * 1000)
+        _tin, _tout = tokens_from_openai_completion(completion)
+        track_usage(
+            user_id=req.employee_id,
+            company_id=req.company_id,
+            feature="recommendation",
+            model="gpt-4",
+            tokens_in=_tin,
+            tokens_out=_tout,
+            latency_ms=_latency_ms,
         )
 
         response_text = completion.choices[0].message.content

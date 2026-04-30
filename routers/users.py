@@ -29,6 +29,7 @@ from db.models.mental_health import Session as MHSession
 from db.models.user import User
 from db.session import get_session
 from routers.auth import get_current_user, get_employer_user
+from utils.audit import log_audit
 
 router = APIRouter(tags=["Employees"])
 
@@ -282,6 +283,16 @@ async def create_employee(
         print(f"[users] create_employee DB error: {e}")
         raise HTTPException(500, "Failed to save employee profile.")
 
+    log_audit(
+        actor_uid=employer.get("id", ""),
+        actor_role=employer.get("role", "employer"),
+        action="user.create",
+        company_id=str(employer_company_uuid) if employer_company_uuid else "",
+        target_uid=uid,
+        target_type="user",
+        metadata={"role": req.role, "email": req.email, "department": req.department},
+    )
+
     return CreateEmployeeResponse(
         success=True,
         uid=uid,
@@ -476,6 +487,16 @@ async def update_employee(
 
     db.commit()
 
+    log_audit(
+        actor_uid=employer.get("id", ""),
+        actor_role=employer.get("role", "employer"),
+        action="user.update",
+        company_id=str(user.company_id) if user.company_id else "",
+        target_uid=uid,
+        target_type="user",
+        metadata={"updated_fields": updated_fields},
+    )
+
     return UpdateEmployeeResponse(
         success=True,
         uid=uid,
@@ -529,6 +550,15 @@ async def _set_employee_active(uid: str, active: bool, employer: dict, db: Sessi
 
     user.is_active = active
     db.commit()
+
+    log_audit(
+        actor_uid=employer.get("id", ""),
+        actor_role=employer.get("role", "employer"),
+        action="user.reactivate" if active else "user.deactivate",
+        company_id=str(company_uuid),
+        target_uid=uid,
+        target_type="user",
+    )
 
     action = "reactivated" if active else "deactivated"
     return DeactivateResponse(
@@ -602,6 +632,15 @@ async def delete_employee(
     )
 
     db.commit()
+
+    log_audit(
+        actor_uid=employer.get("id", ""),
+        actor_role=employer.get("role", "employer"),
+        action="user.delete",
+        company_id=str(company_uuid),
+        target_uid=uid,
+        target_type="user",
+    )
 
     return DeleteEmployeeResponse(
         success=True,
