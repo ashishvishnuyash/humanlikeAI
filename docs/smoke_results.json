@@ -1,0 +1,1302 @@
+{
+  "summary": {
+    "total": 36,
+    "passed": 36,
+    "failed": 0,
+    "errored": 0
+  },
+  "seed": {
+    "super_admin_email": "smoketest+admin-smoke01@example.com",
+    "employer_email": "smoketest+employer-smoke01@example.com",
+    "employee_email": "smoketest+employee-smoke01@example.com",
+    "company_id": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f"
+  },
+  "results": [
+    {
+      "name": "health",
+      "method": "GET",
+      "path": "/health",
+      "role": null,
+      "expected_status": [
+        200
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "status": "ok",
+        "api_key_set": true,
+        "rag_chunks": 229
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "anonymous chat",
+      "method": "POST",
+      "path": "/chat",
+      "role": null,
+      "expected_status": [
+        200,
+        500
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "session_id": "f04ddba2-98fb-4b6b-b09c-d37059a9edfe",
+        "reply": "hey! how\u2019s it going? \ud83d\ude0a",
+        "peek": {
+          "language": "English",
+          "emotion": "Neutral",
+          "emotion_intensity": 0.0,
+          "tone_shift": "stable",
+          "subtext": "They want to connect but might be feeling a bit lonely or uncertain.",
+          "deep_need": "Companionship",
+          "conversation_phase": "opening"
+        },
+        "mesh": {
+          "new_memories": [],
+          "recalled_memories": []
+        },
+        "strategy": "Hey, I\u2019m here for you if you want to talk or just hang out together.",
+        "expression_style": "warm",
+        "retrieved_context": [],
+        "total_memories": 0
+      },
+      "error": null,
+      "note": "Returns 500 if OPENAI_API_KEY missing or LLM call fails."
+    },
+    {
+      "name": "login wrong password",
+      "method": "POST",
+      "path": "/api/auth/login",
+      "role": null,
+      "expected_status": [
+        401
+      ],
+      "actual_status": 401,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "detail": "Invalid email or password."
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "register duplicate email",
+      "method": "POST",
+      "path": "/api/auth/register",
+      "role": null,
+      "expected_status": [
+        409
+      ],
+      "actual_status": 409,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "detail": "A user with this email already exists."
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "me as employer",
+      "method": "GET",
+      "path": "/api/auth/me",
+      "role": "employer",
+      "expected_status": [
+        200
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "uid": "57f46c6e-5699-4c77-9892-5d2d657cda5e",
+        "email": "smoketest+employer-smoke01@example.com",
+        "role": "employer",
+        "company_id": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f"
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "profile as employer",
+      "method": "GET",
+      "path": "/api/auth/profile",
+      "role": "employer",
+      "expected_status": [
+        200
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "id": "57f46c6e-5699-4c77-9892-5d2d657cda5e",
+        "email": "smoketest+employer-smoke01@example.com",
+        "role": "employer",
+        "company_id": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+        "manager_id": null,
+        "department": null,
+        "is_active": true,
+        "profile": {
+          "full_name": "Smoke Test Employer"
+        },
+        "company": {
+          "id": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+          "name": "SmokeTest Co smoke01",
+          "owner_id": "57f46c6e-5699-4c77-9892-5d2d657cda5e",
+          "settings": {},
+          "employee_count": 1
+        }
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "me without token",
+      "method": "GET",
+      "path": "/api/auth/me",
+      "role": null,
+      "expected_status": [
+        401,
+        403
+      ],
+      "actual_status": 401,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "detail": "Not authenticated"
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "admin /me",
+      "method": "GET",
+      "path": "/api/admin/me",
+      "role": "super_admin",
+      "expected_status": [
+        200
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "uid": "242e7a16-a2de-423d-8a4a-e936540b5daa",
+        "email": "smoketest+admin-smoke01@example.com",
+        "role": "super_admin",
+        "displayName": "Diltak Admin",
+        "isActive": true,
+        "createdAt": "2026-04-30T16:31:19.815317+00:00"
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "admin /stats",
+      "method": "GET",
+      "path": "/api/admin/stats",
+      "role": "super_admin",
+      "expected_status": [
+        200
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "totalEmployers": 23,
+        "totalEmployees": 48,
+        "totalCompanies": 24,
+        "totalUsers": 73,
+        "activeUsers": 67,
+        "inactiveUsers": 6,
+        "roleBreakdown": {
+          "manager": 13,
+          "employer": 23,
+          "employee": 33,
+          "super_admin": 2,
+          "hr": 2
+        },
+        "recentJoins": 40,
+        "computedAt": "2026-04-30T22:01:56.363503+00:00"
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "admin list employers",
+      "method": "GET",
+      "path": "/api/admin/employers",
+      "role": "super_admin",
+      "expected_status": [
+        200
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "employers": [
+          {
+            "uid": "8TQrsqvrdRQgpIpr4Buk4HVvREr1",
+            "email": "karanrajak1543@gmail.com",
+            "firstName": "Karan",
+            "lastName": "Rajak",
+            "displayName": "Karan Rajak",
+            "role": "employer",
+            "companyId": "dda686b5-814f-521c-93f1-9d1c4ddccfcf",
+            "companyName": "Tech PRo",
+            "department": null,
+            "position": null,
+            "phone": "7854874587",
+            "jobTitle": "CEO",
+            "hierarchyLevel": 0,
+            "isActive": true,
+            "createdAt": "2026-04-16T11:10:15.430000+00:00",
+            "updatedAt": "2026-04-16T11:10:15.430000+00:00",
+            "createdBy": null
+          },
+          {
+            "uid": "2FC9r34m4TTsRR8jGWD5R3hVob43",
+            "email": "aashish@st2ts.com",
+            "firstName": "ashish",
+            "lastName": "Upadhyay",
+            "displayName": "",
+            "role": "employer",
+            "companyId": "7cdef067-6c95-5a00-9d7f-02c48ab7822f",
+            "companyName": null,
+            "department": null,
+            "position": null,
+            "phone": "+918376859909",
+            "jobTitle": null,
+            "hierarchyLevel": 0,
+            "isActive": true,
+            "createdAt": "2026-04-23T14:03:10.502792+00:00",
+            "updatedAt": "2026-04-23T14:03:10.502792+00:00",
+            "createdBy": null
+          },
+          {
+            "uid": "47da464f-e2fc-48be-a270-9c1c711131eb",
+            "email": "e2e_emp_3630c773@diltak.example.com",
+            "firstName": "E2E",
+            "lastName": "Owner",
+            "displayName": "E2E Owner",
+            "role": "employer",
+            "companyId": "ecd987d2-f0c9-4ec4-a8f4-9d2d6a76470f",
+            "companyName": null,
+            "department": null,
+            "position": null,
+            "phone": "+919999999999",
+            "jobTitle": "CEO",
+            "hierarchyLevel": 0,
+            "isActive": true,
+            "createdAt": "2026-04-30T14:27:49.170853+00:00",
+            "updatedAt": "2026-04-30T14:29:36.241315+00:00",
+            "createdBy": null
+          },
+          "<+17 more>"
+        ],
+        "total": 23,
+        "page": 1,
+        "limit": 20,
+        "totalPages": 2,
+        "hasNext": true,
+        "hasPrev": false
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "admin get employer",
+      "method": "GET",
+      "path": "/api/admin/employers/57f46c6e-5699-4c77-9892-5d2d657cda5e",
+      "role": "super_admin",
+      "expected_status": [
+        200
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "uid": "57f46c6e-5699-4c77-9892-5d2d657cda5e",
+        "email": "smoketest+employer-smoke01@example.com",
+        "firstName": "",
+        "lastName": "",
+        "displayName": "",
+        "role": "employer",
+        "companyId": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+        "companyName": null,
+        "department": null,
+        "position": null,
+        "phone": null,
+        "jobTitle": null,
+        "hierarchyLevel": 0,
+        "isActive": true,
+        "createdAt": "2026-04-30T16:31:24.703295+00:00",
+        "updatedAt": "2026-04-30T16:31:51.198079+00:00",
+        "createdBy": null
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "admin list employees",
+      "method": "GET",
+      "path": "/api/admin/employees",
+      "role": "super_admin",
+      "expected_status": [
+        200
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "employees": [
+          {
+            "uid": "3436FEcIulPMJGkJPHDlXHaTRfo1",
+            "email": "sourav@gmail.com",
+            "firstName": "sourav ",
+            "lastName": "kulkarni",
+            "displayName": "",
+            "role": "manager",
+            "companyId": "409cf16d-a1bf-57f4-b6a5-1d50181adf52",
+            "companyName": null,
+            "department": "Marketing",
+            "position": "CFO",
+            "phone": null,
+            "jobTitle": null,
+            "hierarchyLevel": 1,
+            "isActive": true,
+            "createdAt": "2025-08-12T02:59:58.365000+00:00",
+            "updatedAt": "2025-08-12T03:00:02.996000+00:00",
+            "createdBy": null
+          },
+          {
+            "uid": "BKehQg0K0dM7k97LWsy9NJJBAxv2",
+            "email": "teste5@gmail.com",
+            "firstName": "test",
+            "lastName": "sas",
+            "displayName": "",
+            "role": "employee",
+            "companyId": "7c3a3a2b-0002-5329-ab81-9a8b12ad7c78",
+            "companyName": null,
+            "department": "Engineering",
+            "position": "AI",
+            "phone": null,
+            "jobTitle": null,
+            "hierarchyLevel": 4,
+            "isActive": true,
+            "createdAt": "2025-08-10T09:06:29.340000+00:00",
+            "updatedAt": "2025-08-10T09:06:35.149000+00:00",
+            "createdBy": null
+          },
+          {
+            "uid": "BUwT2LFEFJPfVdQy7UaSiaNaGee2",
+            "email": "test11@gmail.com",
+            "firstName": "test11",
+            "lastName": "11",
+            "displayName": "",
+            "role": "employee",
+            "companyId": "409cf16d-a1bf-57f4-b6a5-1d50181adf52",
+            "companyName": null,
+            "department": "Marketing",
+            "position": "sales",
+            "phone": null,
+            "jobTitle": null,
+            "hierarchyLevel": 4,
+            "isActive": true,
+            "createdAt": "2025-08-14T03:49:37.632000+00:00",
+            "updatedAt": "2025-08-14T03:49:41.167000+00:00",
+            "createdBy": null
+          },
+          "<+17 more>"
+        ],
+        "total": 42,
+        "page": 1,
+        "limit": 20,
+        "totalPages": 3,
+        "hasNext": true,
+        "hasPrev": false
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "admin list companies",
+      "method": "GET",
+      "path": "/api/admin/companies",
+      "role": "super_admin",
+      "expected_status": [
+        200
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "companies": [
+          {
+            "id": "6e48d143-74ad-5854-8e3b-2f5bfce63121",
+            "name": "edme",
+            "industry": "Finance",
+            "size": "51-200 employees",
+            "ownerId": "ojq4kC9BySPzSQQV3KRSDzOeutt1",
+            "employeeCount": 2,
+            "website": null,
+            "description": null,
+            "createdAt": "2026-04-13T11:09:34.669000+00:00",
+            "updatedAt": "2026-04-13T11:25:10.571000+00:00"
+          },
+          {
+            "id": "99c7f814-22c4-5429-87eb-3e5d0dc33fad",
+            "name": "1mg",
+            "industry": "Healthcare",
+            "size": "51-200 employees",
+            "ownerId": "nkCjAVeDxcWBKEkIxjjythPsdO42",
+            "employeeCount": 2,
+            "website": null,
+            "description": null,
+            "createdAt": "2026-04-13T11:35:01.955000+00:00",
+            "updatedAt": "2026-04-13T11:30:19.395000+00:00"
+          },
+          {
+            "id": "aad5a81a-4992-5a39-a5dc-73fecbe1fe95",
+            "name": "companyX",
+            "industry": "Technology",
+            "size": "11-50 employees",
+            "ownerId": "xKvX0a98mJOdaTBjwbKEaaUVrls1",
+            "employeeCount": 0,
+            "website": null,
+            "description": null,
+            "createdAt": "2026-04-22T06:18:52.039000+00:00",
+            "updatedAt": "2026-04-22T06:18:52.039000+00:00"
+          },
+          "<+17 more>"
+        ],
+        "total": 24,
+        "page": 1,
+        "limit": 20,
+        "totalPages": 2,
+        "hasNext": true,
+        "hasPrev": false
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "admin role gate (employer hits admin)",
+      "method": "GET",
+      "path": "/api/admin/employers",
+      "role": "employer",
+      "expected_status": [
+        403
+      ],
+      "actual_status": 403,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "detail": "Access denied. Only super_admin accounts can perform this action. Your role: 'employer'."
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "employer profile",
+      "method": "GET",
+      "path": "/api/employer/profile",
+      "role": "employer",
+      "expected_status": [
+        200
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "uid": "57f46c6e-5699-4c77-9892-5d2d657cda5e",
+        "email": "smoketest+employer-smoke01@example.com",
+        "firstName": "",
+        "lastName": "",
+        "displayName": "",
+        "role": "employer",
+        "jobTitle": null,
+        "phone": null,
+        "companyId": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+        "companyName": "",
+        "isActive": true,
+        "hierarchyLevel": 0,
+        "permissions": {
+          "can_view_team_reports": false,
+          "can_manage_employees": false,
+          "can_approve_leaves": false,
+          "can_view_analytics": false,
+          "can_create_programs": false,
+          "skip_level_access": false
+        },
+        "registeredAt": "2026-04-30T16:31:24.703295+00:00",
+        "updatedAt": "2026-04-30T16:32:02.612118+00:00",
+        "company": {
+          "id": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+          "name": "SmokeTest Co smoke01",
+          "industry": null,
+          "size": null,
+          "ownerId": "57f46c6e-5699-4c77-9892-5d2d657cda5e",
+          "employeeCount": 1,
+          "website": null,
+          "address": null,
+          "phone": null,
+          "description": null,
+          "logoUrl": null,
+          "createdAt": "2026-04-30T16:31:24.703295+00:00",
+          "updatedAt": "2026-04-30T16:31:31.489478+00:00"
+        }
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "employer company",
+      "method": "GET",
+      "path": "/api/employer/company",
+      "role": "employer",
+      "expected_status": [
+        200
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "id": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+        "name": "SmokeTest Co smoke01",
+        "industry": null,
+        "size": null,
+        "ownerId": "57f46c6e-5699-4c77-9892-5d2d657cda5e",
+        "employeeCount": 1,
+        "website": null,
+        "address": null,
+        "phone": null,
+        "description": null,
+        "logoUrl": null,
+        "createdAt": "2026-04-30T16:31:24.703295+00:00",
+        "updatedAt": "2026-04-30T16:31:31.489478+00:00"
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "employer company stats",
+      "method": "GET",
+      "path": "/api/employer/company/stats",
+      "role": "employer",
+      "expected_status": [
+        200
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "companyId": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+        "totalEmployees": 1,
+        "activeEmployees": 1,
+        "inactiveEmployees": 0,
+        "roleBreakdown": {
+          "employee": 1
+        },
+        "departmentBreakdown": {
+          "QA": 1
+        },
+        "recentJoins": 1,
+        "computedAt": "2026-04-30T22:02:08.090023+00:00"
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "list employees",
+      "method": "GET",
+      "path": "/api/employees",
+      "role": "employer",
+      "expected_status": [
+        200
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "success": true,
+        "employees": [
+          {
+            "uid": "b5fca002-09f7-49ac-8acc-5f169b205d3a",
+            "email": "smoketest+employee-smoke01@example.com",
+            "firstName": "Smoke",
+            "lastName": "Employee",
+            "role": "employee",
+            "department": "QA",
+            "position": "Tester",
+            "phone": null,
+            "companyId": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+            "managerId": null,
+            "hierarchyLevel": 1,
+            "isActive": true,
+            "permissions": {
+              "can_view_team_reports": false,
+              "can_manage_employees": false,
+              "can_approve_leaves": false,
+              "can_view_analytics": false,
+              "can_create_programs": false,
+              "skip_level_access": false
+            },
+            "createdAt": "2026-04-30T16:31:31.489478+00:00",
+            "createdBy": "57f46c6e-5699-4c77-9892-5d2d657cda5e"
+          }
+        ],
+        "total": 1,
+        "companyId": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+        "page": 1,
+        "limit": 20,
+        "totalPages": 1,
+        "hasNext": false,
+        "hasPrev": false
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "get employee",
+      "method": "GET",
+      "path": "/api/employees/b5fca002-09f7-49ac-8acc-5f169b205d3a",
+      "role": "employer",
+      "expected_status": [
+        200
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "uid": "b5fca002-09f7-49ac-8acc-5f169b205d3a",
+        "email": "smoketest+employee-smoke01@example.com",
+        "firstName": "Smoke",
+        "lastName": "Employee",
+        "role": "employee",
+        "department": "QA",
+        "position": "Tester",
+        "phone": null,
+        "companyId": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+        "managerId": null,
+        "hierarchyLevel": 1,
+        "isActive": true,
+        "permissions": {
+          "can_view_team_reports": false,
+          "can_manage_employees": false,
+          "can_approve_leaves": false,
+          "can_view_analytics": false,
+          "can_create_programs": false,
+          "skip_level_access": false
+        },
+        "createdAt": "2026-04-30T16:31:31.489478+00:00",
+        "createdBy": "57f46c6e-5699-4c77-9892-5d2d657cda5e"
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "employee role gate (employee hits employer route)",
+      "method": "GET",
+      "path": "/api/employees",
+      "role": "employee",
+      "expected_status": [
+        403
+      ],
+      "actual_status": 403,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "detail": "Access denied. Only employer or HR accounts can perform this action. Your role: 'employee'."
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "wellness-index",
+      "method": "GET",
+      "path": "/api/employer/wellness-index",
+      "role": "employer",
+      "expected_status": [
+        200,
+        500
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "company_id": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+        "team_size_band": "<5 (suppressed)",
+        "wellness_index": 37.5,
+        "stress_score": 50.0,
+        "engagement_score": 0.0,
+        "check_in_participation_pct": 0.0,
+        "period_days": 30,
+        "trend_vs_prior_period": null,
+        "data_quality": "low",
+        "computed_at": "2026-04-30T22:02:14.118769+00:00"
+      },
+      "error": null,
+      "note": "Requires ?company_id= even though JWT carries it."
+    },
+    {
+      "name": "burnout-trend",
+      "method": "GET",
+      "path": "/api/employer/burnout-trend",
+      "role": "employer",
+      "expected_status": [
+        200,
+        500
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "company_id": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+        "period_weeks": 8,
+        "buckets": [
+          {
+            "label": "low",
+            "percentage": 0.0,
+            "trend": "stable"
+          },
+          {
+            "label": "medium",
+            "percentage": 0.0,
+            "trend": "stable"
+          },
+          {
+            "label": "high",
+            "percentage": 0.0,
+            "trend": "stable"
+          }
+        ],
+        "weekly_distribution": [],
+        "alert_level": "green",
+        "computed_at": "2026-04-30T22:02:15.182104+00:00"
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "engagement-signals",
+      "method": "GET",
+      "path": "/api/employer/engagement-signals",
+      "role": "employer",
+      "expected_status": [
+        200,
+        500
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "company_id": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+        "dau_pct": 0.0,
+        "wau_pct": 0.0,
+        "check_in_completion_pct": 0.0,
+        "avg_session_depth_score": 0.0,
+        "period_days": 30,
+        "computed_at": "2026-04-30T22:02:16.272350+00:00"
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "early-warnings",
+      "method": "GET",
+      "path": "/api/employer/early-warnings",
+      "role": "employer",
+      "expected_status": [
+        200,
+        500
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "company_id": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+        "alerts": [],
+        "overall_risk": "green",
+        "computed_at": "2026-04-30T22:02:17.440653+00:00"
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "org wellness-trend",
+      "method": "GET",
+      "path": "/api/employer/org/wellness-trend",
+      "role": "employer",
+      "expected_status": [
+        200,
+        500
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "company_id": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+        "trend": [],
+        "period_weeks": 12,
+        "overall_index": 0.0,
+        "direction": "stable",
+        "computed_at": "2026-04-30T22:02:18.343079+00:00"
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "org department-comparison",
+      "method": "GET",
+      "path": "/api/employer/org/department-comparison",
+      "role": "employer",
+      "expected_status": [
+        200,
+        500
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "company_id": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+        "departments": [
+          {
+            "label": "A",
+            "wellness_index": 42.5,
+            "burnout_risk": "medium",
+            "engagement_pct": 0.0,
+            "size_band": "<5 (suppressed)",
+            "suppressed": false
+          },
+          {
+            "label": "B",
+            "wellness_index": 42.5,
+            "burnout_risk": "medium",
+            "engagement_pct": 0.0,
+            "size_band": "<5 (suppressed)",
+            "suppressed": false
+          }
+        ],
+        "hotspot_label": "A",
+        "label_masking": true,
+        "period_days": 30,
+        "computed_at": "2026-04-30T22:02:19.257894+00:00"
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "org retention-risk",
+      "method": "GET",
+      "path": "/api/employer/org/retention-risk",
+      "role": "employer",
+      "expected_status": [
+        200,
+        422,
+        500
+      ],
+      "actual_status": 422,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "detail": {
+          "error": "insufficient_cohort",
+          "suppressed": true
+        }
+      },
+      "error": null,
+      "note": "Returns 422 with {error:'insufficient_cohort', suppressed:true} when team size is below the k-anonymity threshold."
+    },
+    {
+      "name": "insights predictive-trends",
+      "method": "GET",
+      "path": "/api/employer/insights/predictive-trends",
+      "role": "employer",
+      "expected_status": [
+        200,
+        500
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "company_id": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+        "forecast_weeks": 4,
+        "historical": [],
+        "forecast": [],
+        "model_note": "Burnout risk uses a stress + inverse-mood proxy model. Attrition risk combines burnout proxy with engagement decay. Forecast uses linear extrapolation \u2014 confidence decreases with horizon.",
+        "computed_at": "2026-04-30T22:02:21.513880+00:00"
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "insights benchmarks",
+      "method": "GET",
+      "path": "/api/employer/insights/benchmarks",
+      "role": "employer",
+      "expected_status": [
+        200,
+        500
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "company_id": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+        "industry": "cross-industry",
+        "comparisons": [
+          {
+            "metric": "wellness_index",
+            "your_value": 0.0,
+            "benchmark_value": 60.0,
+            "delta": -60.0,
+            "direction": "below",
+            "benchmark_source": "Anonymised cross-industry median (Diltak network)"
+          },
+          {
+            "metric": "burnout_high_pct",
+            "your_value": 50.0,
+            "benchmark_value": 20.0,
+            "delta": 30.0,
+            "direction": "above",
+            "benchmark_source": "Anonymised cross-industry median (Diltak network)"
+          },
+          {
+            "metric": "diltak_engagement_pct",
+            "your_value": 0.0,
+            "benchmark_value": 55.0,
+            "delta": -55.0,
+            "direction": "below",
+            "benchmark_source": "Anonymised cross-industry median (Diltak network)"
+          }
+        ],
+        "summary": "Your team is below benchmark on 2 metric(s). Targeted playbooks available in Suggested Actions.",
+        "period_days": 30,
+        "computed_at": "2026-04-30T22:02:23.706546+00:00"
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "insights cohorts",
+      "method": "GET",
+      "path": "/api/employer/insights/cohorts",
+      "role": "employer",
+      "expected_status": [
+        200,
+        500
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "company_id": "78ca7dcd-39a4-4821-b42e-fc7c320f7c9f",
+        "cohorts": [
+          {
+            "label": "0\u20136 months",
+            "size_band": "<5 (suppressed)",
+            "wellness_index": 37.5,
+            "burnout_risk": "medium",
+            "engagement_pct": 0.0,
+            "suppressed": false
+          },
+          {
+            "label": "6\u201312 months",
+            "size_band": "<5 (suppressed)",
+            "wellness_index": 0.0,
+            "burnout_risk": "unknown",
+            "engagement_pct": 0.0,
+            "suppressed": true
+          },
+          {
+            "label": "1\u20133 years",
+            "size_band": "<5 (suppressed)",
+            "wellness_index": 0.0,
+            "burnout_risk": "unknown",
+            "engagement_pct": 0.0,
+            "suppressed": true
+          },
+          "<+1 more>"
+        ],
+        "period_days": 30,
+        "privacy_note": "Data aggregated by tenure band. Individual user data is never exposed.",
+        "computed_at": "2026-04-30T22:02:25.909325+00:00"
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "admin metrics overview",
+      "method": "GET",
+      "path": "/api/admin/overview",
+      "role": "super_admin",
+      "expected_status": [
+        200,
+        500
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "totalCompanies": 24,
+        "totalEmployers": 23,
+        "totalEmployees": 48,
+        "activeUsers": 67,
+        "inactiveUsers": 6,
+        "newUsersLast30d": 40,
+        "totalCreditsConsumed": 0.0,
+        "totalLifetimeSpend": 0.0,
+        "companiesAtWarning": 0,
+        "companiesAtCritical": 0,
+        "computedAt": "2026-04-30T22:02:26.861735+00:00"
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "admin metrics usage",
+      "method": "GET",
+      "path": "/api/admin/usage",
+      "role": "super_admin",
+      "expected_status": [
+        200,
+        500
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "records": [
+          {
+            "id": "70c256d8-ac73-4091-9cca-a2ad9468f2f5",
+            "userId": "62819bf0-734c-4f29-b691-f81cf3cdc1a3",
+            "companyId": "",
+            "feature": "recommendation",
+            "model": "gpt-4",
+            "provider": "openai",
+            "tokensIn": 504,
+            "tokensOut": 1202,
+            "totalTokens": 1706,
+            "estimatedCostUsd": 0.000797,
+            "latencyMs": 27755,
+            "success": true,
+            "error": null,
+            "timestamp": "2026-04-30T22:00:04.840871+00:00"
+          },
+          {
+            "id": "dbba99ad-4697-4422-ad42-071a9c06a918",
+            "userId": "a8ce7b4d-2560-4e63-b85c-17db9f8d29a6",
+            "companyId": "",
+            "feature": "report",
+            "model": "gpt-4o-mini",
+            "provider": "openai",
+            "tokensIn": 1211,
+            "tokensOut": 466,
+            "totalTokens": 1677,
+            "estimatedCostUsd": 0.000461,
+            "latencyMs": 7818,
+            "success": true,
+            "error": null,
+            "timestamp": "2026-04-30T20:40:00.279825+00:00"
+          },
+          {
+            "id": "af3b738e-bfd2-47bd-9b17-b2e4c91cae30",
+            "userId": "a8ce7b4d-2560-4e63-b85c-17db9f8d29a6",
+            "companyId": "",
+            "feature": "report",
+            "model": "gpt-4o-mini",
+            "provider": "openai",
+            "tokensIn": 749,
+            "tokensOut": 222,
+            "totalTokens": 971,
+            "estimatedCostUsd": 0.000246,
+            "latencyMs": 4119,
+            "success": true,
+            "error": null,
+            "timestamp": "2026-04-30T20:39:52.461604+00:00"
+          },
+          "<+10 more>"
+        ],
+        "total": 13,
+        "page": 1,
+        "limit": 50,
+        "totalPages": 1,
+        "hasNext": false,
+        "hasPrev": false,
+        "summary": {
+          "totalTokensIn": 23989,
+          "totalTokensOut": 4839,
+          "totalCostUsd": 0.006501,
+          "totalCalls": 13
+        }
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "physical-health check-ins",
+      "method": "GET",
+      "path": "/api/physical-health/check-ins",
+      "role": "employee",
+      "expected_status": [
+        200,
+        500
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "success": true,
+        "checkins": [],
+        "total": 0,
+        "page": 1,
+        "limit": 20,
+        "totalPages": 1,
+        "hasNext": false,
+        "hasPrev": false
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "physical-health score",
+      "method": "GET",
+      "path": "/api/physical-health/score",
+      "role": "employee",
+      "expected_status": [
+        200,
+        500
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "score": 0.0,
+        "level": "low",
+        "last_checkin_date": null,
+        "days_since_checkin": null,
+        "streak_days": 0,
+        "highlights": [
+          "Start tracking your physical health with a daily check-in."
+        ],
+        "concerns": []
+      },
+      "error": null,
+      "note": ""
+    },
+    {
+      "name": "reports recent",
+      "method": "GET",
+      "path": "/api/reports/recent",
+      "role": "employer",
+      "expected_status": [
+        200,
+        500
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "success": true,
+        "data": {
+          "companyReports": {
+            "count": 0,
+            "analytics": {
+              "totalReports": 0,
+              "avgWellness": 0.0,
+              "avgStress": 0.0,
+              "avgMood": 0.0,
+              "avgEnergy": 0.0,
+              "highRiskCount": 0,
+              "mediumRiskCount": 0,
+              "lowRiskCount": 0,
+              "departmentBreakdown": {},
+              "dailyTrends": []
+            },
+            "aiContext": "Company Wellness: Avg 0/10. High Risk: 0."
+          },
+          "personalHistory": null
+        }
+      },
+      "error": null,
+      "note": "Note: this endpoint uses camelCase 'companyId' query param while most other endpoints use snake_case 'company_id'."
+    },
+    {
+      "name": "recommendations generate (employee)",
+      "method": "POST",
+      "path": "/api/recommendations/generate",
+      "role": "employee",
+      "expected_status": [
+        200,
+        500
+      ],
+      "actual_status": 200,
+      "outcome": "PASS",
+      "response_excerpt": {
+        "success": true,
+        "recommendations": [
+          {
+            "id": "unique_id_1",
+            "recommendation_type": "meditation",
+            "title": "Guided Deep Breathing Session",
+            "description": "A short guided deep breathing session to help reduce stress and improve mood",
+            "instructions": [
+              "Find a comfortable, quiet place to sit",
+              "Close your eyes",
+              "Follow the guided audio for deep breathing",
+              "<+1 more>"
+            ],
+            "duration_minutes": 15,
+            "difficulty_level": "beginner",
+            "mood_targets": [
+              "stress_relief",
+              "calm"
+            ],
+            "wellness_metrics_affected": [
+              "stress_anxiety",
+              "emotional_tone"
+            ],
+            "ai_generated": true,
+            "personalized_for_user": true,
+            "created_at": "2026-04-30T22:02:34.031356Z"
+          },
+          {
+            "id": "unique_id_2",
+            "recommendation_type": "exercise",
+            "title": "Quick Energizing Stretching Routine",
+            "description": "A quick stretching routine to boost energy and improve mood",
+            "instructions": [
+              "Stand up and find a clear space",
+              "Follow the guided stretching routine",
+              "Focus on your breathing throughout",
+              "<+1 more>"
+            ],
+            "duration_minutes": 15,
+            "difficulty_level": "beginner",
+            "mood_targets": [
+              "energy_boost",
+              "stress_relief"
+            ],
+            "wellness_metrics_affected": [
+              "physical_activity",
+              "energy_levels"
+            ],
+            "ai_generated": true,
+            "personalized_for_user": true,
+            "created_at": "2026-04-30T22:02:34.031356Z"
+          },
+          {
+            "id": "unique_id_3",
+            "recommendation_type": "journaling",
+            "title": "Gratitude Journaling",
+            "description": "Writing down things that you are grateful for to improve mood",
+            "instructions": [
+              "Find a quiet spot and get a pen and paper",
+              "Think about your day and write down three things you are grateful for",
+              "Reflect on why these things make you grateful"
+            ],
+            "duration_minutes": 15,
+            "difficulty_level": "beginner",
+            "mood_targets": [
+              "calm",
+              "focus",
+              "motivation"
+            ],
+            "wellness_metrics_affected": [
+              "emotional_tone",
+              "motivation_engagement"
+            ],
+            "ai_generated": true,
+            "personalized_for_user": true,
+            "created_at": "2026-04-30T22:02:34.031356Z"
+          },
+          "<+3 more>"
+        ],
+        "generated_at": "2026-04-30T22:03:27.648598Z",
+        "context": {
+          "current_mood": 5,
+          "current_stress": 6,
+          "current_energy": 4,
+          "time_available": 15
+        }
+      },
+      "error": null,
+      "note": "Allows 500 because OpenAI call may transiently fail."
+    }
+  ],
+  "teardown": {
+    "deleted_users": 3,
+    "deleted_companies": 1,
+    "deleted_refresh_tokens": 3
+  }
+}
