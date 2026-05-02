@@ -67,7 +67,7 @@ _ALLOWED_TYPES = {
     "application/msword":                                               "docx",
 }
 _ALLOWED_EXTENSIONS = (".pdf", ".docx", ".doc")
-_MAX_FILE_BYTES = 10 * 1024 * 1024   # 10 MB
+_MAX_FILE_BYTES = 100 * 1024 * 1024  # 100 MB — generous limit, chunker handles any size
 
 
 # ─── Auth helper: get uid + company_id from token ────────────────────────────
@@ -415,7 +415,7 @@ async def upload_medical_report(
     # Read and size-check
     file_bytes = await file.read()
     if len(file_bytes) > _MAX_FILE_BYTES:
-        raise HTTPException(400, "File too large. Maximum size is 10 MB.")
+        raise HTTPException(400, "File too large. Maximum size is 100 MB.")
     if not file_bytes:
         raise HTTPException(400, "File is empty.")
 
@@ -615,8 +615,15 @@ async def delete_medical_document(
         except Exception as e:
             errors.append(f"storage: {e}")
 
-    # 2. Delete RAG chunks — chunk IDs not persisted in current schema;
-    #    Phase 5 schema migration will add rag_chunk_ids to MedicalDocument.
+    # 2. Delete RAG chunks from Pinecone
+    if row.rag_chunk_ids:
+        try:
+            from rag import get_rag_store
+            store = get_rag_store()
+            for cid in row.rag_chunk_ids:
+                store.delete_chunk(cid)
+        except Exception as e:
+            errors.append(f"rag: {e}")
 
     # 3. Delete DB record
     try:
@@ -668,12 +675,11 @@ async def generate_report(
     except Exception as e:
         raise HTTPException(500, f"Query failed: {e}")
 
-    if len(rows) < 3:
+    if len(rows) < 1:
         raise HTTPException(
             422,
-            f"Not enough check-in data to generate a report. "
-            f"Found {len(rows)} check-ins in the last {req.days} days. "
-            f"Please complete at least 3 check-ins first."
+            f"No check-in data found in the last {req.days} days. "
+            f"Please complete at least one check-in first."
         )
 
     records = [_row_to_dict(r) for r in rows]

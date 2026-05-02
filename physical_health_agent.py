@@ -182,11 +182,10 @@ async def process_medical_document(
         )
 
         # Step 2 — RAG ingestion (filtered by user_id so Q&A stays private)
-        # chunk_ids will be persisted in Phase 5 (rag_chunk_ids column on MedicalDocument)
-        chunk_ids: List[str] = []  # noqa: F841
+        chunk_ids: List[str] = []
         try:
             store = get_rag_store()
-            chunk_ids = store.add_documents(  # noqa: F841
+            chunk_ids = store.add_documents(
                 texts=[raw_text],
                 metadata_per_doc=[{
                     "type":        "medical_report",
@@ -197,6 +196,13 @@ async def process_medical_document(
                 chunk_size=400,
                 chunk_overlap=80,
             )
+            # Persist chunk IDs so delete can clean up Pinecone vectors
+            if chunk_ids:
+                with SessionLocal() as db:
+                    db.query(MedicalDocument).filter(
+                        MedicalDocument.id == uuid.UUID(doc_id)
+                    ).update({"rag_chunk_ids": chunk_ids})
+                    db.commit()
         except Exception as rag_err:
             print(f"[physical_health_agent] RAG ingestion error for {doc_id}: {rag_err}")
             # Non-fatal — analysis still saved without RAG
@@ -284,7 +290,7 @@ def generate_periodic_report(
         f"Average pain level: {aggregates.get('avg_pain_level', 0):.1f}/10 (10=no pain)\n"
         f"Average hydration: {aggregates.get('avg_hydration', 0):.1f}/10\n"
         f"Days with exercise: {aggregates.get('exercise_days', 0)}\n"
-        f"Average exercise minutes (on active days): {aggregates.get('avg_exercise_minutes', 0):.0f}min\n"
+        f"Average exercise minutes (on active days): {aggregates.get('avg_exercise_minutes_daily', 0):.0f}min\n"
     )
 
     # Fetch medical context from RAG
@@ -324,7 +330,6 @@ def generate_periodic_report(
         model      = "gpt-4o-mini",
         tokens_in  = _tin,
         tokens_out = _tout,
-        db         = db,
         latency_ms = int((time.time() - _t0) * 1000),
     )
 
