@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import BigInteger, ForeignKey, Index, String, Text, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from db.models import Base
@@ -79,6 +79,9 @@ class MedicalDocument(Base):
     mime_type: Mapped[str | None] = mapped_column(String, nullable=True)
     size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     extracted_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rag_chunk_ids: Mapped[list[str]] = mapped_column(
+        ARRAY(String), nullable=False, server_default="{}"
+    )
     uploaded_at: Mapped[datetime] = mapped_column(
         nullable=False, server_default=func.now()
     )
