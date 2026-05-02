@@ -257,7 +257,48 @@ async def chat_handler(request: Request, db: Session = Depends(get_session)):
             }
 
     if req_data.get("endSession"):
-        return await generate_wellness_report(
+        uma_session_id = req_data.get("umaSessionId")
+
+        # ── Guard: require at least 6 user turns for a meaningful report ────────
+        user_turns = [m for m in messages if m.get("sender") == "user"]
+        if len(user_turns) < 6:
+            # Clean up Uma session even when report is skipped
+            if uma_session_id:
+                from main import sessions as _uma_sessions
+                _uma_sessions.pop(uma_session_id, None)
+            return {
+                "type": "message",
+                "data": {
+                    "content": (
+                        "We need a bit more conversation before I can generate your wellness report. "
+                        "Please share a little more — I want to make sure the report reflects your "
+                        "experience accurately."
+                    ),
+                    "sender": "ai",
+                    "umaSessionId": uma_session_id,
+                    "emotion": "Neutral",
+                    "avatarEmotion": "IDLE",
+                    "emotionIntensity": 0.0,
+                    "expressionStyle": "gentle",
+                    "conversationPhase": "seeking",
+                }
+            }
+
+        # ── Scope: only use messages from the current Uma session window ─────────
+        # The Uma session tracks exactly how many exchanges happened this session.
+        # We trim the frontend messages list to that window so old accumulated
+        # messages from previous sessions don't bleed into the report.
+        if uma_session_id:
+            from main import sessions as _uma_sessions
+            uma_session = _uma_sessions.get(uma_session_id)
+            if uma_session:
+                # uma_session["messages"] has alternating HumanMessage / AIMessage
+                # for the current session only — use its count as the trim window
+                current_session_msg_count = len(uma_session.get("messages", []))
+                if current_session_msg_count > 0 and len(messages) > current_session_msg_count:
+                    messages = messages[-current_session_msg_count:]
+
+        report_response = await generate_wellness_report(
             messages,
             req_data.get("sessionType", "text"),
             req_data.get("sessionDuration", 0),
@@ -265,6 +306,13 @@ async def chat_handler(request: Request, db: Session = Depends(get_session)):
             req_data.get("companyId", ""),
             db,
         )
+
+        # ── Cleanup: wipe Uma session so next conversation starts fresh ──────────
+        if uma_session_id:
+            from main import sessions as _uma_sessions
+            _uma_sessions.pop(uma_session_id, None)
+
+        return report_response
 
     return await generate_chat_response(
         messages,
