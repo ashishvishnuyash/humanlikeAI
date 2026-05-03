@@ -840,32 +840,81 @@ async def ask_medical_question(
 ):
     uid, _ = _get_user_context(user_token, db)
 
-    # RAG retrieval filtered strictly by user_id
+    # Recency-aware: pure semantic retrieval can't rank by upload date,
+    # so for "recent / latest / last" questions we anchor on the most recently
+    # uploaded document directly from Postgres.
+    q_lower = req.question.lower()
+    wants_recent = any(
+        kw in q_lower for kw in ("most recent", "latest", "last report", "recent report")
+    )
+
+    recent_doc: Optional[MedicalDocument] = None
+    if wants_recent:
+        recent_doc = (
+            db.query(MedicalDocument)
+            .filter(MedicalDocument.user_id == uid)
+            .order_by(MedicalDocument.uploaded_at.desc())
+            .first()
+        )
+
+    # RAG retrieval filtered strictly by user_id. Threshold lowered to 0.25
+    # — vague natural-language questions typically score 0.30–0.45 even on
+    # relevant chunks, so the previous 0.4 gate dropped most matches.
     try:
         from rag import get_rag_store
         store = get_rag_store()
         chunks = store.retrieve(
             query=req.question,
-            top_k=4,
+            top_k=6,
             metadata_filter={
                 "$and": [
                     {"user_id": {"$eq": uid}},
                     {"type": {"$eq": "medical_report"}},
                 ]
             },
+            threshold=0.25,
         )
     except Exception as e:
         raise HTTPException(500, f"Knowledge retrieval failed: {e}")
 
+    # If RAG produced nothing usable, fall back to the most recently uploaded
+    # document's extracted text (covers ingestion-failed-silently cases).
     if not chunks:
-        return AskResponse(
-            answer=(
-                "I could not find any relevant information in your uploaded medical documents. "
-                "Please upload a medical report first, or try rephrasing your question."
-            ),
-            source_doc_ids=[],
-            confidence=0.0,
+        fallback_doc = recent_doc or (
+            db.query(MedicalDocument)
+            .filter(MedicalDocument.user_id == uid)
+            .order_by(MedicalDocument.uploaded_at.desc())
+            .first()
         )
+        if fallback_doc and fallback_doc.extracted_text:
+            chunks = [{
+                "text": fallback_doc.extracted_text[:8000],
+                "score": 0.3,
+                "metadata": {"doc_id": str(fallback_doc.id)},
+            }]
+        else:
+            return AskResponse(
+                answer=(
+                    "I could not find any relevant information in your uploaded medical documents. "
+                    "Please upload a medical report first, or try rephrasing your question."
+                ),
+                source_doc_ids=[],
+                confidence=0.0,
+            )
+
+    # Recency anchor: if the user asked for the most recent report and it isn't
+    # already represented in the retrieved chunks, prepend its full text.
+    if recent_doc and recent_doc.extracted_text:
+        recent_doc_id = str(recent_doc.id)
+        already_in = any(
+            c.get("metadata", {}).get("doc_id") == recent_doc_id for c in chunks
+        )
+        if not already_in:
+            chunks.insert(0, {
+                "text": recent_doc.extracted_text[:8000],
+                "score": max((c.get("score", 0) for c in chunks), default=0.3),
+                "metadata": {"doc_id": recent_doc_id},
+            })
 
     context_text = "\n\n---\n\n".join(c["text"] for c in chunks)
     source_doc_ids = list({

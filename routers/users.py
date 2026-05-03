@@ -293,17 +293,6 @@ async def create_employee(
         metadata={"role": req.role, "email": req.email, "department": req.department},
     )
 
-    log_audit(
-        actor_uid=employer.get("id", ""),
-        actor_role=employer.get("role", "employer"),
-        action="user.create",
-        company_id=employer_company_id,
-        db=db,
-        target_uid=uid,
-        target_type="user",
-        metadata={"role": req.role, "email": req.email, "department": req.department},
-    )
-
     return CreateEmployeeResponse(
         success=True,
         uid=uid,

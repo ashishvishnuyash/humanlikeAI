@@ -58,6 +58,7 @@ class RAGStore:
         self._embeddings: Optional[OpenAIEmbeddings] = None
         
         self.index_name = os.environ.get("PINECONE_INDEX_NAME", "uma-rag")
+        self.host = os.environ.get("PINECONE_HOST")  # optional direct host URL
         self._pc: Optional[Pinecone] = None
         self._vectorstore: Optional[PineconeVectorStore] = None
 
@@ -80,14 +81,22 @@ class RAGStore:
             print("WARNING: PINECONE_API_KEY is not set. RAGStore will be unavailable.")
             return
 
-        print(f"Connecting to Pinecone index: '{self.index_name}'...")
+        target = f"host='{self.host}'" if self.host else f"index='{self.index_name}'"
+        print(f"Connecting to Pinecone via {target}...")
         try:
             self._pc = Pinecone(api_key=api_key)
-            self._vectorstore = PineconeVectorStore(
-                index_name=self.index_name,
-                embedding=self._get_embeddings(),
-                pinecone_api_key=api_key
-            )
+            if self.host:
+                self._vectorstore = PineconeVectorStore(
+                    host=self.host,
+                    embedding=self._get_embeddings(),
+                    pinecone_api_key=api_key,
+                )
+            else:
+                self._vectorstore = PineconeVectorStore(
+                    index_name=self.index_name,
+                    embedding=self._get_embeddings(),
+                    pinecone_api_key=api_key,
+                )
             print("Successfully connected to Pinecone vector store.")
         except Exception as e:
             print(f"Error initializing Pinecone vector store: {e}")
@@ -125,7 +134,10 @@ class RAGStore:
                 parts = [text]
             for part in parts:
                 all_chunks_text.append(part)
-                all_meta.append(meta)
+                # Per-chunk copy: langchain_pinecone writes the chunk text into
+                # metadata['text'], so a shared dict ref would have every chunk
+                # store the LAST chunk's text.
+                all_meta.append(dict(meta))
                 all_ids.append(str(uuid.uuid4()))
 
         # Add texts to Pinecone

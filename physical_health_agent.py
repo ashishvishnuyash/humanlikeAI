@@ -163,77 +163,63 @@ async def process_medical_document(
     """
     Background task triggered after a medical file is uploaded.
 
-    Steps:
-    1. Analyse with LLM → MedicalReportAnalysis
-    2. Ingest text chunks into RAG with medical metadata
+    Steps (RAG first so retrieval works even if LLM steps fail):
+    1. Ingest text chunks into RAG with medical metadata
+    2. Analyse with LLM → MedicalReportAnalysis (isolated failure)
     3. Fetch recent check-in context for suggestions
     4. Generate personalised suggestions
-    5. Update MedicalDocument extracted_text if empty (text already set at upload)
-    6. If urgency_level == "emergency" → write wellness_event for in-app alert
+    5. If urgency_level == "emergency" → write wellness_event for in-app alert
 
     NOTE: Analysis metadata fields (status, summary, key_findings, etc.) are not
     persisted in the current MedicalDocument schema. Phase 5 will add a metadata
     JSONB column for full persistence.
     """
+    # Step 1 — RAG ingestion FIRST so the doc is retrievable even if
+    # downstream LLM steps fail (rate limit, parse error, malformed PDF, etc.)
     try:
-        # Step 1 — LLM analysis
+        store = get_rag_store()
+        chunk_ids = store.add_documents(
+            texts=[raw_text],
+            metadata_per_doc=[{
+                "type":        "medical_report",
+                "user_id":     user_id,
+                "doc_id":      doc_id,
+                "report_type": report_type,
+            }],
+            chunk_size=400,
+            chunk_overlap=80,
+        )
+        if chunk_ids:
+            with SessionLocal() as db:
+                db.query(MedicalDocument).filter(
+                    MedicalDocument.id == uuid.UUID(doc_id)
+                ).update({"rag_chunk_ids": chunk_ids})
+                db.commit()
+    except Exception as rag_err:
+        print(f"[physical_health_agent] RAG ingestion error for {doc_id}: {rag_err}")
+
+    # Step 2 — LLM analysis (isolated; failure here does NOT block ingestion)
+    analysis = None
+    try:
         analysis = analyze_medical_document(
             raw_text, user_id=user_id, company_id=company_id
         )
+    except Exception as e:
+        print(f"[physical_health_agent] analyze_medical_document failed for {doc_id}: {e}")
 
-        # Step 2 — RAG ingestion (filtered by user_id so Q&A stays private)
-        chunk_ids: List[str] = []
-        try:
-            store = get_rag_store()
-            chunk_ids = store.add_documents(
-                texts=[raw_text],
-                metadata_per_doc=[{
-                    "type":        "medical_report",
-                    "user_id":     user_id,
-                    "doc_id":      doc_id,
-                    "report_type": report_type,
-                }],
-                chunk_size=400,
-                chunk_overlap=80,
-            )
-            # Persist chunk IDs so delete can clean up Pinecone vectors
-            if chunk_ids:
-                with SessionLocal() as db:
-                    db.query(MedicalDocument).filter(
-                        MedicalDocument.id == uuid.UUID(doc_id)
-                    ).update({"rag_chunk_ids": chunk_ids})
-                    db.commit()
-        except Exception as rag_err:
-            print(f"[physical_health_agent] RAG ingestion error for {doc_id}: {rag_err}")
-            # Non-fatal — analysis still saved without RAG
+    if analysis is None:
+        return  # nothing more to do without analysis
 
+    try:
         # Step 3 — fetch recent check-in context for suggestions
         checkin_context = _build_checkin_context(user_id)
 
         # Step 4 — personalised suggestions
-        # suggestions will be persisted in Phase 5 (metadata JSONB column on MedicalDocument)
         suggestions = generate_health_suggestions(  # noqa: F841
             analysis, checkin_context, user_id=user_id, company_id=company_id
         )
 
-        # Step 5 — update extracted_text if it was empty at upload time
-        # (Phase 5 will persist full analysis metadata via a JSONB column)
-        try:
-            with SessionLocal() as db:
-                doc = (
-                    db.query(MedicalDocument)
-                    .filter(MedicalDocument.id == uuid.UUID(doc_id))
-                    .one_or_none()
-                )
-                if doc is not None and not doc.extracted_text:
-                    db.query(MedicalDocument).filter(
-                        MedicalDocument.id == uuid.UUID(doc_id)
-                    ).update({"extracted_text": raw_text})
-                    db.commit()
-        except Exception as e:
-            print(f"[physical_health_agent] MedicalDocument update error for {doc_id}: {e}")
-
-        # Step 6 — emergency escalation (user-only alert, never visible to employer)
+        # Step 5 — emergency escalation (user-only alert, never visible to employer)
         if analysis.urgency_level == "emergency":
             try:
                 cid: Optional[uuid.UUID] = uuid.UUID(company_id) if company_id else None

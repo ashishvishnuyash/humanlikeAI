@@ -155,9 +155,12 @@ ANSWER_HEALTH_QUESTION = ChatPromptTemplate.from_template(
     "The user has uploaded their medical reports and is asking a question about them.\n\n"
 
     "IMPORTANT RULES:\n"
-    "- Only answer using information from the provided context below.\n"
-    "- If the answer is not in the context, say: "
-    "'I could not find this information in your uploaded documents.'\n"
+    "- Use the context below as the source of truth and answer the user's question.\n"
+    "- The first context block is typically the user's most recent report when they "
+    "asked about recency — use it as the primary source for 'most recent / latest' questions.\n"
+    "- If the context is partially relevant, still summarise what IS there rather than refusing.\n"
+    "- Only say 'I could not find this information in your uploaded documents' when the "
+    "context is genuinely empty or contains nothing about the topic.\n"
     "- Do NOT diagnose, prescribe, or give clinical advice beyond what is in the documents.\n"
     "- Keep the answer clear, concise, and in plain language.\n\n"
 
@@ -167,6 +170,6 @@ ANSWER_HEALTH_QUESTION = ChatPromptTemplate.from_template(
     "═══ USER QUESTION ═══\n"
     "{question}\n\n"
 
-    "Answer the question based only on the context above. "
+    "Answer the question based on the context above. "
     "Be factual and cite relevant values or findings where helpful."
 )
