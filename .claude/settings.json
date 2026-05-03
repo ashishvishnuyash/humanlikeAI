@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git merge *)",
+      "Bash(git checkout *)",
+      "Bash(git stash *)",
+      "Bash(rm firebase_config.py firebaseadmn.json firestore.indexes.json migration/fs_export.py migration/copy_storage.py migration/run_all.py tests/test_fs_export.py)",
+      "Bash(ls firebase* firestore*)",
+      "Bash(ls migration/)",
+      "Bash(grep -v \"^FIREBASE_\" .env)",
+      "Bash(mv .env.tmp .env)",
+      "Bash(grep -v \"^$\")",
+      "Bash(venv/Scripts/python.exe -m scripts.api_test_seed --setup)",
+      "Bash(venv/Scripts/python.exe -c \"import sys; print\\(sys.executable\\); import sqlalchemy; print\\(sqlalchemy.__version__\\)\")",
+      "Bash(python -c \"import sys; print\\(sys.executable\\); import sqlalchemy; print\\(sqlalchemy.__version__\\); import fastapi; print\\(fastapi.__version__\\)\")"
+    ]
+  }
+}
