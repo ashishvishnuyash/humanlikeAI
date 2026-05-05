@@ -59,10 +59,16 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 class RegisterRequest(BaseModel):
+    model_config = {"populate_by_name": True}
+
     email: EmailStr
     password: str = Field(min_length=8)
-    company_name: str = Field(min_length=1)
-    full_name: Optional[str] = None
+    first_name: str = Field(alias="firstName", min_length=1)
+    last_name: str = Field(alias="lastName", min_length=1)
+    company_name: str = Field(alias="companyName", min_length=1)
+    company_size: Optional[str] = Field(default=None, alias="companySize")
+    industry: Optional[str] = None
+    full_name: Optional[str] = None  # kept for backward compat
 
 
 class LoginRequest(BaseModel):
@@ -129,9 +135,26 @@ def register(req: RegisterRequest, db: Session = Depends(get_session)) -> TokenP
     if existing is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, "A user with this email already exists.")
 
-    company = Company(id=uuid.uuid4(), name=req.company_name, settings={})
+    company_settings: dict = {}
+    if req.company_size:
+        company_settings["size"] = req.company_size
+    if req.industry:
+        company_settings["industry"] = req.industry
+
+    company = Company(id=uuid.uuid4(), name=req.company_name, settings=company_settings)
     db.add(company)
     db.flush()  # gets company.id
+
+    # full_name: prefer the explicit request value, but treat whitespace-only as
+    # missing and fall back to the parts. display_name is what the rest of the
+    # codebase reads (super_admin, employer, users routers), so keep them in sync.
+    full_name = (req.full_name or "").strip() or f"{req.first_name} {req.last_name}".strip()
+    profile = {
+        "first_name": req.first_name,
+        "last_name": req.last_name,
+        "full_name": full_name,
+        "display_name": full_name,
+    }
 
     user = User(
         id=str(uuid.uuid4()),
@@ -140,7 +163,7 @@ def register(req: RegisterRequest, db: Session = Depends(get_session)) -> TokenP
         role="employer",
         company_id=company.id,
         is_active=True,
-        profile={"full_name": req.full_name} if req.full_name else {},
+        profile=profile,
     )
     db.add(user)
     db.flush()

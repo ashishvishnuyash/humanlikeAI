@@ -23,7 +23,12 @@ class AnonymousProfile(Base):
         String,
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
-        unique=True,
+    )
+    company_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("companies.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
     handle: Mapped[str] = mapped_column(String, nullable=False, unique=True)
     avatar: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -32,6 +37,15 @@ class AnonymousProfile(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_anonymous_profiles_user_company",
+            "user_id",
+            "company_id",
+            unique=True,
+        ),
     )
 
 
@@ -140,6 +154,18 @@ class UserGamification(Base):
     )
     streak: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default="0"
+    )
+    longest_streak: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    challenges_completed: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    weekly_goal: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="5"
+    )
+    monthly_goal: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="20"
     )
     extras: Mapped[dict] = mapped_column(
         JSONB, nullable=False, server_default="{}"

@@ -89,7 +89,6 @@ def _track(state: ReportState, raw_msg, node_name: str, latency_ms: int) -> None
     """Extract token counts from a LangChain AIMessage and fire usage log."""
     try:
         from middleware.usage_tracker import track_usage, tokens_from_langchain_raw
-        from firebase_config import get_db
         tin, tout = tokens_from_langchain_raw(raw_msg)
         track_usage(
             user_id    = state.get("user_id", ""),
@@ -98,7 +97,6 @@ def _track(state: ReportState, raw_msg, node_name: str, latency_ms: int) -> None
             model      = "gpt-4o-mini",
             tokens_in  = tin,
             tokens_out = tout,
-            db         = get_db(),
             latency_ms = latency_ms,
         )
     except Exception as e:

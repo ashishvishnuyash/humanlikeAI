@@ -1,3 +1,4 @@
+import logging
 import os
 import json
 import time
@@ -14,6 +15,24 @@ from db.models.mental_health import AIRecommendation as AIRecommendationModel, C
 from middleware.usage_tracker import track_usage, tokens_from_openai_completion
 from routers.auth import get_current_user
 from middleware.usage_tracker import track_usage, tokens_from_openai_completion
+
+_logger = logging.getLogger(__name__)
+
+
+def _coerce_company_uuid(value: str | None) -> uuid.UUID | None:
+    """Convert a company_id string to UUID. If the value is not a valid UUID
+    (e.g. Firebase-style 'company_<uid>'), log a warning and return None.
+
+    This preserves existing silent-fallback behavior so production callers
+    don't break, but makes the misuse observable in logs."""
+    if not value:
+        return None
+    try:
+        return uuid.UUID(value)
+    except (ValueError, AttributeError):
+        _logger.warning("non-UUID company_id received in recommendations: %r", value)
+        return None
+
 
 router = APIRouter(prefix="/recommendations", tags=["Recommendations"], dependencies=[Depends(get_current_user)])
 
@@ -323,13 +342,8 @@ Guidelines:
         print(f"Error generating AI recommendations: {e}")
         recommendations = generate_fallback_recommendations(req.current_mood, req.current_stress, req.current_energy, req.time_available)
 
-    # Parse company_id — treat invalid/empty strings as None
-    company_uuid: uuid.UUID | None = None
-    if req.company_id:
-        try:
-            company_uuid = uuid.UUID(req.company_id)
-        except ValueError:
-            company_uuid = None
+    # Parse company_id — treat invalid/empty strings as None (logs warning for non-UUID values)
+    company_uuid = _coerce_company_uuid(req.company_id)
 
     now_iso = datetime.utcnow().isoformat() + "Z"
 

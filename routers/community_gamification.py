@@ -133,10 +133,26 @@ def _parse_uuid(value: str, field: str = "id") -> uuid.UUID:
         raise HTTPException(status_code=400, detail=f"Invalid {field}: {value!r}")
 
 
-def get_or_create_anonymous_profile(employee_id: str, db: Session) -> dict:
-    profile = db.query(AnonymousProfile).filter(
-        AnonymousProfile.user_id == employee_id
-    ).one_or_none()
+def get_or_create_anonymous_profile(
+    employee_id: str, company_id: Optional[str], db: Session
+) -> dict:
+    """Find or create the anonymous profile for (employee_id, company_id).
+    The same user in two different companies gets two distinct profiles."""
+    company_uuid: Optional[uuid.UUID] = None
+    if company_id:
+        try:
+            company_uuid = uuid.UUID(company_id)
+        except (ValueError, AttributeError):
+            company_uuid = None
+
+    profile = (
+        db.query(AnonymousProfile)
+        .filter(
+            AnonymousProfile.user_id == employee_id,
+            AnonymousProfile.company_id == company_uuid,
+        )
+        .one_or_none()
+    )
 
     if profile is not None:
         return model_to_dict(profile)
@@ -149,12 +165,31 @@ def get_or_create_anonymous_profile(employee_id: str, db: Session) -> dict:
     new_profile = AnonymousProfile(
         id=uuid.uuid4(),
         user_id=employee_id,
+        company_id=company_uuid,
         handle=handle,
         avatar=avatar_color,
     )
     db.add(new_profile)
     db.commit()
     return model_to_dict(new_profile)
+
+
+def _build_post_dict(post: "CommunityPost", handle: Optional[str], extras: dict) -> dict:
+    """Shape a CommunityPost row into the response dict the frontend expects.
+
+    `author_id` mirrors the AnonymousProfile.handle (e.g. "User_AB12CD34")
+    because the frontend's Firestore version stores the post author as that
+    short opaque string. We keep `anonymous_profile_id` (UUID) for backward
+    compat with any callers that read the FK form."""
+    d = model_to_dict(post)
+    d["author_id"] = handle
+    d["title"] = extras.get("title")
+    d["category"] = extras.get("category", "general")
+    d["tags"] = extras.get("tags", [])
+    d["is_anonymous"] = True
+    d["views"] = 0
+    d["is_pinned"] = False
+    return d
 
 
 @router.post("/community", response_model=GenericCommunityResponse)
@@ -170,7 +205,20 @@ async def handle_community(req: CommunityRequest, db: Session = Depends(get_sess
             )
             .all()
         )
-        posts = [model_to_dict(r) for r in rows]
+
+        # Bulk-load handles so we don't N+1.
+        profile_ids = {r.anonymous_profile_id for r in rows if r.anonymous_profile_id}
+        handles_by_id: dict[uuid.UUID, str] = {}
+        if profile_ids:
+            for ap in db.query(AnonymousProfile).filter(
+                AnonymousProfile.id.in_(profile_ids)
+            ).all():
+                handles_by_id[ap.id] = ap.handle
+
+        posts = []
+        for r in rows:
+            handle = handles_by_id.get(r.anonymous_profile_id)
+            posts.append(_build_post_dict(r, handle=handle, extras={}))
 
         category = req.data.get('category') if req.data else None
         if category and category != 'all':
@@ -191,24 +239,25 @@ async def handle_community(req: CommunityRequest, db: Session = Depends(get_sess
     elif req.action == 'get_anonymous_profile':
         if not req.employee_id:
             raise HTTPException(400, "employee_id required")
-        prof = get_or_create_anonymous_profile(req.employee_id, db)
+        prof = get_or_create_anonymous_profile(req.employee_id, req.company_id, db)
         return {"action": "get_anonymous_profile", "success": True, "profile": prof}
 
     elif req.action == 'create_post':
         if not req.employee_id:
             raise HTTPException(400, "employee_id required")
         company_uuid = _parse_uuid(req.company_id, "company_id")
-        prof = get_or_create_anonymous_profile(req.employee_id, db)
+        prof = get_or_create_anonymous_profile(req.employee_id, req.company_id, db)
 
         profile_obj = db.query(AnonymousProfile).filter(
-            AnonymousProfile.user_id == req.employee_id
+            AnonymousProfile.user_id == req.employee_id,
+            AnonymousProfile.company_id == company_uuid,
         ).one_or_none()
 
         content = req.data.get('content', '') if req.data else ''
         post = CommunityPost(
             id=uuid.uuid4(),
             company_id=company_uuid,
-            anonymous_profile_id=uuid.UUID(prof['id']) if profile_obj else None,
+            anonymous_profile_id=profile_obj.id if profile_obj else None,
             content=content,
             likes=0,
             replies=0,
@@ -216,14 +265,11 @@ async def handle_community(req: CommunityRequest, db: Session = Depends(get_sess
         )
         db.add(post)
         db.commit()
-        post_dict = model_to_dict(post)
-        # Preserve extra fields from request for response shape parity
-        post_dict['title'] = req.data.get('title') if req.data else None
-        post_dict['category'] = req.data.get('category', 'general') if req.data else 'general'
-        post_dict['tags'] = req.data.get('tags', []) if req.data else []
-        post_dict['is_anonymous'] = True
-        post_dict['views'] = 0
-        post_dict['is_pinned'] = False
+        post_dict = _build_post_dict(
+            post,
+            handle=profile_obj.handle if profile_obj else None,
+            extras=req.data if req.data else {},
+        )
         return {"action": "create_post", "success": True, "post_id": str(post.id), "post": post_dict}
 
     elif req.action == 'get_replies':
@@ -246,9 +292,11 @@ async def handle_community(req: CommunityRequest, db: Session = Depends(get_sess
     elif req.action == 'create_reply':
         if not req.employee_id:
             raise HTTPException(400, "employee_id required")
-        prof = get_or_create_anonymous_profile(req.employee_id, db)
+        company_uuid = _parse_uuid(req.company_id, "company_id")
+        prof = get_or_create_anonymous_profile(req.employee_id, req.company_id, db)
         profile_obj = db.query(AnonymousProfile).filter(
-            AnonymousProfile.user_id == req.employee_id
+            AnonymousProfile.user_id == req.employee_id,
+            AnonymousProfile.company_id == company_uuid,
         ).one_or_none()
 
         pid = req.data.get('post_id') if req.data else None
@@ -333,6 +381,10 @@ def _ug_to_stats_dict(ug: UserGamification) -> dict:
         'badges': list(ug.badges or []),
         'streak': ug.streak,
         'current_streak': ug.streak,        # compat alias
+        'longest_streak': ug.longest_streak,
+        'challenges_completed': ug.challenges_completed,
+        'weekly_goal': ug.weekly_goal,
+        'monthly_goal': ug.monthly_goal,
         'updated_at': ug.updated_at,
     }
 
@@ -415,6 +467,8 @@ async def handle_gamification(req: GamificationRequest, db: Session = Depends(ge
         ug.points = new_pts
         ug.level = new_lvl
         ug.streak = streak
+        if streak > ug.longest_streak:
+            ug.longest_streak = streak
         db.commit()
 
         stats = _ug_to_stats_dict(ug)
@@ -480,6 +534,9 @@ async def handle_gamification(req: GamificationRequest, db: Session = Depends(ge
         return {"action": "get_available_challenges", "success": True, "challenges": challenges}
 
     elif req.action == 'join_challenge':
+        ug, _ = get_or_create_user_stats(req.employee_id, req.company_id, db)
+        ug.challenges_completed = (ug.challenges_completed or 0) + 1
+        db.commit()
         return {"action": "join_challenge", "success": True, "message": "Challenge joined successfully"}
 
     raise HTTPException(400, "Invalid action")

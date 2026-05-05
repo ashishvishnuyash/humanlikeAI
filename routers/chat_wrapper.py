@@ -16,6 +16,7 @@ from middleware.usage_tracker import track_usage, tokens_from_openai_completion
 from report_schemas import ReportRequest, ReportResponse
 from report_agent import run_report
 from middleware.usage_tracker import track_usage, tokens_from_openai_completion
+from routers.chat_wrapper_assessments import ASSESSMENT_DATA
 
 
 router = APIRouter(prefix="/chat_wrapper", tags=["Chat Wrapper"])
@@ -57,28 +58,6 @@ class AiChatResponse(BaseModel):
     session_id: Optional[str] = None
     user_id: Optional[str] = None
 
-# --- Assessment Data ---
-ASSESSMENT_DATA = {
-    "personality_profiler": {
-        "questions": {
-            1: "Does your mood fluctuate?",
-            2: "Do you bother too much about what others think of you?",
-            # ... truncating for brevity, we will just return a placeholder or the first few
-            # for the migration, I will include a subset to make it functional
-            3: "Do you like talking much?",
-            4: "If you make a commitment to someone, do you abide by it irrespective of discomfort?",
-        },
-        "scoring_instructions": "Please answer 'yes' or 'no' to each question.",
-    },
-    "self_efficacy_scale": {
-        "questions": [
-            "I can solve tedious problems with sincere efforts.",
-            "If someone disagrees with me, I can still manage to get what I want with ease.",
-            "It is easy for me to remain focused on my objectives and achieve my goals.",
-        ],
-        "scoring_instructions": "Rate each statement 1-4 (1=Not at all true, 4=Exactly true).",
-    }
-}
 
 def get_openai_client():
     api_key = os.environ.get("OPENAI_API_KEY")
@@ -177,6 +156,10 @@ async def generate_wellness_report(
             'session_type': session_type,
             'session_duration_minutes': session_duration
         }
+        # Physical health metrics — default to empty dict so the frontend's
+        # fallback defaults render without errors. Real metrics will be added
+        # by the physical_health pipeline when wired through.
+        client_data.setdefault("physical_health_metrics", raw_report.get("physical_health_metrics") or {})
 
         if user_id:
             try:
@@ -372,10 +355,14 @@ async def handle_ai_chat(req: AiChatReq):
         raise HTTPException(500, detail=str(e))
 
 @router.post("/analyze", response_model=ReportResponse)
-async def analyze_chat_wrapper_standalone(req: ReportRequest):
+async def analyze_chat_wrapper_standalone(
+    req: ReportRequest,
+    db: Session = Depends(get_session),
+):
     """
     Standalone endpoint to analyze a chat conversation and generate a comprehensive report.
-    This accepts a structured ReportRequest and returns a full ReportResponse.
+    Returns the rich ReportResponse AND persists a MentalHealthReport row so the
+    dashboard / reports list / detail pages can read it.
     """
     if not os.environ.get("OPENAI_API_KEY"):
         raise HTTPException(500, "OPENAI_API_KEY not configured.")
@@ -389,4 +376,73 @@ async def analyze_chat_wrapper_standalone(req: ReportRequest):
         lines.append(f"{role}: {m.content}")
     conversation_text = "\n".join(lines)
 
-    return run_report(user_id=req.user_id, conversation_text=conversation_text)
+    response = run_report(user_id=req.user_id, conversation_text=conversation_text)
+
+    # ── Persist a MentalHealthReport row keyed by user_id ─────────────────────
+    # The dashboard / reports pages read the JSONB report field — we flatten
+    # the rich blocks into the legacy field names (mood_rating, stress_level, …)
+    # so existing readers don't need to change.
+    try:
+        # Resolve company_id from the user row
+        from db.models.user import User
+        company_uuid = None
+        user_row = db.query(User).filter(User.id == req.user_id).one_or_none()
+        if user_row is not None and user_row.company_id is not None:
+            company_uuid = user_row.company_id
+
+        mh = response.mental_health
+        ph = response.physical_health
+        ov = response.overall
+        mh_m = mh.metrics or {}
+        ph_m = ph.metrics or {}
+
+        def _score(metrics: dict, key: str, fallback: float) -> int:
+            v = metrics.get(key) if isinstance(metrics, dict) else None
+            if isinstance(v, dict) and "score" in v:
+                v = v["score"]
+            try:
+                return max(1, min(10, int(round(float(v if v is not None else fallback)))))
+            except (TypeError, ValueError):
+                return max(1, min(10, int(round(float(fallback)))))
+
+        flat = {
+            "mood_rating": _score(mh_m, "emotional_tone", mh.score),
+            "stress_level": _score(mh_m, "stress_anxiety", 5),
+            "anxiety_level": _score(mh_m, "stress_anxiety", 5),
+            "energy_level": _score(ph_m, "activity", ph.score),
+            "work_satisfaction": _score(mh_m, "motivation_engagement", mh.score),
+            "work_life_balance": _score(mh_m, "work_life_balance", mh.score),
+            "confidence_level": _score(mh_m, "self_esteem", mh.score),
+            "sleep_quality": _score(ph_m, "lifestyle", ph.score),
+            "overall_wellness": max(1, min(10, int(round(ov.score)))),
+            "ai_analysis": ov.full_report or ov.summary,
+            "key_insights": ov.key_insights or [],
+            "recommendations": ov.recommendations or [],
+            "session_type": "text",
+            "employee_id": req.user_id,
+            # rich blocks for the detail page
+            "mental_health": mh.model_dump(),
+            "physical_health": ph.model_dump(),
+            "overall": ov.model_dump(),
+            "meta": response.meta.model_dump(),
+        }
+
+        risk = ov.priority or "low"
+        row = MentalHealthReport(
+            id=uuid.uuid4(),
+            user_id=req.user_id,
+            company_id=company_uuid,
+            report=flat,
+            risk_level=risk,
+        )
+        db.add(row)
+        db.commit()
+    except Exception as e:
+        # Don't fail the response if persistence breaks — log and continue.
+        print(f"[chat_wrapper.analyze] DB persistence error: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+    return response
