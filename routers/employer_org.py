@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from db.models import CheckIn, Intervention, MHSession, User
+from db.models import CheckIn, Intervention, MentalHealthReport, MHSession, User
 from db.session import get_session
 from routers.auth import get_current_user
 from utils.audit import log_audit
@@ -101,7 +101,12 @@ def _fetch_all_users_sa(company_id_uuid: uuid.UUID, db: Session) -> List[dict]:
 def _fetch_company_check_ins_sa(
     company_id_uuid: uuid.UUID, db: Session, days: int = 90
 ) -> List[dict]:
-    """Fetch check-ins for a company from Postgres (last `days` days)."""
+    """Fetch wellness signals for a company from Postgres (last `days` days).
+
+    Combines explicit `CheckIn` rows and AI-generated `MentalHealthReport` rows —
+    both carry mood/stress fields and represent the same conceptual signal for
+    cohort-level analytics.
+    """
     cid_str = str(company_id_uuid)
     cache_key = f"check_ins:{cid_str}:{days}"
     cached = _cache_get(cache_key)
@@ -109,8 +114,10 @@ def _fetch_company_check_ins_sa(
         return cached
 
     cutoff = utc_now() - timedelta(days=days)
+    results: List[dict] = []
+
     try:
-        rows = (
+        check_in_rows = (
             db.query(CheckIn)
             .filter(
                 CheckIn.company_id == company_id_uuid,
@@ -118,8 +125,7 @@ def _fetch_company_check_ins_sa(
             )
             .all()
         )
-        results = []
-        for r in rows:
+        for r in check_in_rows:
             d = r.data or {}
             results.append(
                 {
@@ -130,17 +136,45 @@ def _fetch_company_check_ins_sa(
                     "created_at": r.created_at,
                 }
             )
-        _cache_set(cache_key, results)
-        return results
     except Exception as e:
         print(f"[employer_org] check-ins fetch error: {e}")
-        return []
+
+    try:
+        report_rows = (
+            db.query(MentalHealthReport)
+            .filter(
+                MentalHealthReport.company_id == company_id_uuid,
+                MentalHealthReport.generated_at >= cutoff,
+            )
+            .all()
+        )
+        for r in report_rows:
+            d = r.report or {}
+            results.append(
+                {
+                    "user_id": r.user_id,
+                    "company_id": cid_str,
+                    "mood_score": d.get("mood_score", d.get("mood_rating", 5)),
+                    "stress_level": d.get("stress_level", 5),
+                    "created_at": r.generated_at,
+                }
+            )
+    except Exception as e:
+        print(f"[employer_org] reports-as-checkins fetch error: {e}")
+
+    _cache_set(cache_key, results)
+    return results
 
 
 def _fetch_sessions_sa(
     company_id_uuid: uuid.UUID, db: Session, days: int = 90
 ) -> List[dict]:
-    """Fetch sessions for a company from Postgres (last `days` days)."""
+    """Fetch sessions for a company from Postgres (last `days` days).
+
+    Combines explicit `MHSession` rows and `MentalHealthReport` rows — each saved
+    report represents a completed chat session and so counts toward engagement
+    metrics (adoption, WAU, completion rate).
+    """
     cid_str = str(company_id_uuid)
     cache_key = f"sessions:{cid_str}:{days}"
     cached = _cache_get(cache_key)
@@ -148,6 +182,8 @@ def _fetch_sessions_sa(
         return cached
 
     cutoff = utc_now() - timedelta(days=days)
+    results: List[dict] = []
+
     try:
         rows = (
             db.query(MHSession)
@@ -157,21 +193,46 @@ def _fetch_sessions_sa(
             )
             .all()
         )
-        results = [
-            {
-                "user_id": r.user_id,
-                "company_id": cid_str,
-                "created_at": r.created_at,
-                "modality": (r.messages or {}).get("modality") if isinstance(r.messages, dict) else None,
-                "completed": r.ended_at is not None,
-            }
-            for r in rows
-        ]
-        _cache_set(cache_key, results)
-        return results
+        for r in rows:
+            results.append(
+                {
+                    "user_id": r.user_id,
+                    "company_id": cid_str,
+                    "created_at": r.created_at,
+                    "modality": (r.messages or {}).get("modality") if isinstance(r.messages, dict) else None,
+                    "completed": r.ended_at is not None,
+                }
+            )
     except Exception as e:
         print(f"[employer_org] sessions fetch error: {e}")
-        return []
+
+    try:
+        report_rows = (
+            db.query(MentalHealthReport)
+            .filter(
+                MentalHealthReport.company_id == company_id_uuid,
+                MentalHealthReport.generated_at >= cutoff,
+            )
+            .all()
+        )
+        for r in report_rows:
+            d = r.report or {}
+            session_type = d.get("session_type")
+            modality = "voice" if session_type in ("voice", "voice_call") else "text"
+            results.append(
+                {
+                    "user_id": r.user_id,
+                    "company_id": cid_str,
+                    "created_at": r.generated_at,
+                    "modality": modality,
+                    "completed": True,
+                }
+            )
+    except Exception as e:
+        print(f"[employer_org] reports-as-sessions fetch error: {e}")
+
+    _cache_set(cache_key, results)
+    return results
 
 
 def _compute_team_size_sa(company_id_uuid: uuid.UUID, db: Session) -> int:
@@ -280,6 +341,8 @@ class RetentionRiskResponse(BaseModel):
     period_days: int
     note: str = "Modelled from engagement + stress proxy signals. No individual data."
     computed_at: str
+    suppressed: bool = False
+    suppression_reason: Optional[str] = None
 
 
 class DiltakEngagementResponse(BaseModel):
@@ -474,6 +537,21 @@ async def get_department_comparison(
             continue
 
         dept_cins = [c for uid in uids for c in user_checkins.get(uid, [])]
+
+        # Suppress departments with no actual check-in data — otherwise the
+        # mood/stress defaults (5.0) produce a misleading phantom wellness_index
+        # of 42.5 that looks like a real measurement.
+        if not dept_cins:
+            dept_metrics.append(DepartmentMetric(
+                label=label,
+                wellness_index=0,
+                burnout_risk="unknown",
+                engagement_pct=0,
+                size_band=_size_band(n),
+                suppressed=True,
+            ))
+            continue
+
         moods     = [c.get("mood_score", 5) for c in dept_cins if "mood_score" in c]
         stresses  = [c.get("stress_level", 5) for c in dept_cins if "stress_level" in c]
         engaged   = sum(1 for uid in uids if user_sessions.get(uid, 0) > 0)
@@ -527,7 +605,15 @@ async def get_retention_risk(
     cid = _parse_company_uuid(company_id)
     team_size = _compute_team_size_sa(cid, db)
     if team_size < K_ANON_THRESHOLD:
-        raise HTTPException(422, {"error": "insufficient_cohort", "suppressed": True})
+        return RetentionRiskResponse(
+            company_id=company_id,
+            risk_bands=[],
+            overall_risk="green",
+            period_days=period_days,
+            computed_at=utc_now().isoformat(),
+            suppressed=True,
+            suppression_reason="insufficient_cohort",
+        )
 
     check_ins = _fetch_company_check_ins_sa(cid, db, days=period_days)
     sessions  = _fetch_sessions_sa(cid, db, days=period_days)
@@ -571,7 +657,15 @@ async def get_retention_risk(
 
     total = high_risk + medium_risk + low_risk
     if total < K_ANON_THRESHOLD:
-        raise HTTPException(422, {"error": "insufficient_cohort", "suppressed": True})
+        return RetentionRiskResponse(
+            company_id=company_id,
+            risk_bands=[],
+            overall_risk="green",
+            period_days=period_days,
+            computed_at=utc_now().isoformat(),
+            suppressed=True,
+            suppression_reason="insufficient_cohort",
+        )
 
     # Compute prior period for trend
     prior_check = _fetch_company_check_ins_sa(cid, db, days=period_days * 2)
@@ -897,7 +991,7 @@ async def get_program_effectiveness(
 
     # ── Fallback: derive lift from check-in history when no interventions logged ──
     if not cohorts:
-        all_ci = _fetch_company_check_ins(company_id, db, days=90)
+        all_ci = _fetch_company_check_ins_sa(cid, db, days=90)
         dated  = sorted(
             [c for c in all_ci if _ts_to_dt(c.get("created_at"))],
             key=lambda c: _ts_to_dt(c["created_at"]),
